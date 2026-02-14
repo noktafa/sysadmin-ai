@@ -110,6 +110,17 @@ Safety rules from `soul.md` (if present in the script directory) are loaded into
 
 Every session automatically writes a structured log file in JSONL format (one JSON object per line) to `~/.sysadmin-ai/logs/session_<YYYYMMDD_HHMMSS>.jsonl`.
 
+### Log redaction
+
+All log entries pass through a redaction filter before being written to disk. Secrets matching known patterns are replaced with `[REDACTED]` so they never appear in plaintext log files.
+
+Redacted patterns include:
+- **API keys** — OpenAI (`sk-`), AWS (`AKIA`), Google (`AIza`), GitHub (`ghp_`, `gho_`, `ghs_`, `github_pat_`), GitLab (`glpat-`), Slack (`xoxb-`), Stripe (`sk_live_`, `rk_live_`), Square (`sq0atp-`), HuggingFace (`hf_`), SendGrid (`SG.`)
+- **Authorization headers** — `Bearer <token>`
+- **Shell secret assignments** — `export PASSWORD=...`, `set API_KEY=...`, `$env:SECRET_TOKEN=...`
+- **Private key blocks** — `-----BEGIN RSA PRIVATE KEY-----` (all key types)
+- **AWS secret access keys** — `aws_secret_access_key = ...`
+
 Override the log directory with `--log-dir`:
 
 ```bash
@@ -155,6 +166,11 @@ python -m pytest tests/ -v
 30 tests across 7 classes: safety filter, shell execution, PowerShell wrapping, Windows execution, CWD tracking, encoding, and message history trimming. One test (Unix `cd` tracking) is automatically skipped on Windows.
 
 ## Release Notes
+
+### v0.10.1
+
+- **Log redaction** — all log entries are now scrubbed for secrets before writing to JSONL. `redact_text()` / `redact_data()` filter 18 regex patterns covering API keys (OpenAI, AWS, Google, GitHub, GitLab, Slack, Stripe, Square, HuggingFace, SendGrid), Bearer tokens, shell secret assignments (`export`/`set`/`$env:`), PEM private key blocks, and AWS secret access keys. Integrated at the `log_event()` chokepoint so every event is filtered.
+- **24 new redaction tests** — `TestRedaction` class covers all 18 patterns plus safe-text passthrough and recursive `redact_data()` on dicts/lists. Total: 54 tests across 8 classes.
 
 ### v0.10.0
 

@@ -17,6 +17,9 @@ from sysadmin_ai import (
     check_command_safety,
     _needs_powershell_wrap,
     trim_message_history,
+    redact_text,
+    redact_data,
+    REDACT_PLACEHOLDER,
     MAX_HISTORY_MESSAGES,
     _IS_WINDOWS,
 )
@@ -387,6 +390,153 @@ class TestTrimMessageHistory(unittest.TestCase):
         # len = MAX_HISTORY_MESSAGES + 1, should NOT trim
         result = trim_message_history(msgs)
         self.assertEqual(len(result), len(msgs))
+
+
+# ------------------------------------------------------------------ #
+# 8. Log redaction                                                     #
+# ------------------------------------------------------------------ #
+class TestRedaction(unittest.TestCase):
+    """redact_text / redact_data must scrub secrets before logging."""
+
+    # --- API key patterns ---
+
+    def test_openai_key(self):
+        text = "key is sk-abc123def456ghi789jkl012mno345pqr678stu901"
+        self.assertNotIn("sk-", redact_text(text))
+        self.assertIn(REDACT_PLACEHOLDER, redact_text(text))
+
+    def test_openai_project_key(self):
+        text = "sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ab"
+        self.assertIn(REDACT_PLACEHOLDER, redact_text(text))
+
+    def test_aws_access_key(self):
+        text = "my key is AKIAIOSFODNN7EXAMPLE"
+        result = redact_text(text)
+        self.assertNotIn("AKIA", result)
+        self.assertIn(REDACT_PLACEHOLDER, result)
+
+    def test_google_api_key(self):
+        text = "AIzaSyA1234567890abcdefghijklmnopqrstuvwx"
+        self.assertIn(REDACT_PLACEHOLDER, redact_text(text))
+
+    def test_github_pat(self):
+        text = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn"
+        self.assertIn(REDACT_PLACEHOLDER, redact_text(text))
+
+    def test_github_fine_grained_pat(self):
+        text = "github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        self.assertIn(REDACT_PLACEHOLDER, redact_text(text))
+
+    def test_gitlab_pat(self):
+        text = "glpat-ABCDEFghijklmnopqrstuvwxyz"
+        self.assertIn(REDACT_PLACEHOLDER, redact_text(text))
+
+    def test_slack_token(self):
+        text = "xoxb-1234567890-abcdefghij"
+        self.assertIn(REDACT_PLACEHOLDER, redact_text(text))
+
+    def test_stripe_key(self):
+        # Build dynamically to avoid GitHub push protection false positive
+        fake_stripe = "sk_live_" + "X" * 24
+        text = f"key is {fake_stripe}"
+        self.assertIn(REDACT_PLACEHOLDER, redact_text(text))
+
+    def test_huggingface_token(self):
+        text = "hf_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"
+        self.assertIn(REDACT_PLACEHOLDER, redact_text(text))
+
+    def test_bearer_token(self):
+        text = "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abcdef"
+        result = redact_text(text)
+        self.assertNotIn("eyJ", result)
+
+    # --- Shell secret assignments ---
+
+    def test_export_password(self):
+        text = 'export DB_PASSWORD="hunter2"'
+        result = redact_text(text)
+        self.assertNotIn("hunter2", result)
+        self.assertIn(REDACT_PLACEHOLDER, result)
+
+    def test_export_api_key(self):
+        text = "export API_KEY=sk-abc123def456ghi789jkl012mno345pqr678stu901"
+        result = redact_text(text)
+        self.assertNotIn("sk-abc", result)
+
+    def test_env_secret_powershell(self):
+        text = '$env:SECRET_TOKEN="my-secret-value-here"'
+        result = redact_text(text)
+        self.assertNotIn("my-secret-value-here", result)
+
+    def test_set_credentials(self):
+        text = "set AWS_CREDENTIALS=someLongCredentialString123"
+        result = redact_text(text)
+        self.assertNotIn("someLongCredentialString", result)
+
+    # --- Private key blocks ---
+
+    def test_private_key_block(self):
+        text = (
+            "-----BEGIN RSA PRIVATE KEY-----\n"
+            "MIIEpAIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF8PYbO3a\n"
+            "-----END RSA PRIVATE KEY-----"
+        )
+        result = redact_text(text)
+        self.assertNotIn("BEGIN RSA PRIVATE KEY", result)
+        self.assertIn(REDACT_PLACEHOLDER, result)
+
+    def test_ec_private_key(self):
+        text = (
+            "-----BEGIN EC PRIVATE KEY-----\n"
+            "somekeydata\n"
+            "-----END EC PRIVATE KEY-----"
+        )
+        self.assertIn(REDACT_PLACEHOLDER, redact_text(text))
+
+    # --- AWS Secret Access Key ---
+
+    def test_aws_secret_access_key(self):
+        text = "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        result = redact_text(text)
+        self.assertNotIn("wJalrX", result)
+
+    # --- Safe text should pass through unchanged ---
+
+    def test_safe_text_unchanged(self):
+        safe = "df -h shows 50% usage on /dev/sda1"
+        self.assertEqual(redact_text(safe), safe)
+
+    def test_normal_command_output_unchanged(self):
+        output = "total 128\ndrwxr-xr-x  5 root root 4096 Feb 14 10:00 etc"
+        self.assertEqual(redact_text(output), output)
+
+    # --- redact_data (recursive dict/list/str) ---
+
+    def test_redact_data_dict(self):
+        data = {
+            "command": "echo hello",
+            "output": "key is sk-abc123def456ghi789jkl012mno345pqr678stu901",
+        }
+        result = redact_data(data)
+        self.assertEqual(result["command"], "echo hello")
+        self.assertIn(REDACT_PLACEHOLDER, result["output"])
+        self.assertNotIn("sk-", result["output"])
+
+    def test_redact_data_nested(self):
+        data = {"info": {"token": "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn"}}
+        result = redact_data(data)
+        self.assertIn(REDACT_PLACEHOLDER, result["info"]["token"])
+
+    def test_redact_data_list(self):
+        data = ["safe text", "AKIAIOSFODNN7EXAMPLE"]
+        result = redact_data(data)
+        self.assertEqual(result[0], "safe text")
+        self.assertIn(REDACT_PLACEHOLDER, result[1])
+
+    def test_redact_data_non_string(self):
+        """Non-string values (int, None) pass through unchanged."""
+        self.assertEqual(redact_data(42), 42)
+        self.assertIsNone(redact_data(None))
 
 
 # ------------------------------------------------------------------ #

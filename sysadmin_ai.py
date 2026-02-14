@@ -68,8 +68,70 @@ def setup_logging(log_dir=None):
     return logger
 
 
+REDACT_PLACEHOLDER = "[REDACTED]"
+
+# Patterns that match secrets/credentials in free text.
+# Each tuple: (compiled_regex, description_for_testing).
+_REDACT_PATTERNS = [
+    # --- API keys / tokens (known prefixes) ---
+    (re.compile(r"sk-[A-Za-z0-9_-]{20,}"),            "OpenAI API key"),
+    (re.compile(r"sk-proj-[A-Za-z0-9_-]{20,}"),       "OpenAI project key"),
+    (re.compile(r"AKIA[0-9A-Z]{16}"),                  "AWS Access Key ID"),
+    (re.compile(r"AIza[A-Za-z0-9_-]{35}"),             "Google API key"),
+    (re.compile(r"ghp_[A-Za-z0-9]{36,}"),              "GitHub PAT"),
+    (re.compile(r"gho_[A-Za-z0-9]{36,}"),              "GitHub OAuth token"),
+    (re.compile(r"ghs_[A-Za-z0-9]{36,}"),              "GitHub App token"),
+    (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),      "GitHub fine-grained PAT"),
+    (re.compile(r"glpat-[A-Za-z0-9_-]{20,}"),          "GitLab PAT"),
+    (re.compile(r"xox[bpors]-[A-Za-z0-9-]{10,}"),     "Slack token"),
+    (re.compile(r"SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}"), "SendGrid API key"),
+    (re.compile(r"sk_live_[A-Za-z0-9]{24,}"),          "Stripe secret key"),
+    (re.compile(r"rk_live_[A-Za-z0-9]{24,}"),          "Stripe restricted key"),
+    (re.compile(r"sq0atp-[A-Za-z0-9_-]{22,}"),         "Square access token"),
+    (re.compile(r"hf_[A-Za-z0-9]{34,}"),               "HuggingFace token"),
+    # --- Generic high-entropy tokens (Bearer, Authorization headers) ---
+    (re.compile(r"(?i)(Bearer\s+)[A-Za-z0-9_\-.]{20,}"), "Bearer token"),
+    # --- Shell variable assignments with secret-looking names ---
+    (re.compile(
+        r"(?i)(?:export\s+|set\s+|\$env:)"           # export / set / $env:
+        r"[A-Za-z_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|APIKEY|CREDENTIALS?|AUTH)"
+        r"[A-Za-z_]*"
+        r"\s*=\s*"
+        r"""('[^']*'|"[^"]*"|\S+)"""                  # the value
+    ), "shell secret assignment"),
+    # --- Private key blocks ---
+    (re.compile(
+        r"-----BEGIN[ A-Z]*PRIVATE KEY-----"
+        r"[\s\S]*?"
+        r"-----END[ A-Z]*PRIVATE KEY-----"
+    ), "private key block"),
+    # --- AWS Secret Access Key (40-char base64 after known label) ---
+    (re.compile(
+        r"(?i)(?:aws_secret_access_key|secret_access_key)\s*[=:]\s*[A-Za-z0-9/+=]{40}"
+    ), "AWS Secret Access Key"),
+]
+
+
+def redact_text(text):
+    """Replace secrets/credentials in *text* with a placeholder."""
+    for pattern, _ in _REDACT_PATTERNS:
+        text = pattern.sub(REDACT_PLACEHOLDER, text)
+    return text
+
+
+def redact_data(obj):
+    """Recursively redact secret values in a dict/list/string."""
+    if isinstance(obj, str):
+        return redact_text(obj)
+    if isinstance(obj, dict):
+        return {k: redact_data(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [redact_data(item) for item in obj]
+    return obj
+
+
 def log_event(logger, event, data=None):
-    """Emit a structured log entry."""
+    """Emit a structured log entry (with secret redaction)."""
     record = logger.makeRecord(
         name="sysadmin_ai",
         level=logging.INFO,
@@ -79,7 +141,7 @@ def log_event(logger, event, data=None):
         args=(),
         exc_info=None,
     )
-    record.data = data or {}
+    record.data = redact_data(data or {})
     logger.handle(record)
 
 
