@@ -7,6 +7,7 @@ import subprocess
 import json
 import logging
 from datetime import datetime, timezone
+from abc import ABC, abstractmethod
 from pathlib import Path
 from openai import OpenAI
 
@@ -14,6 +15,7 @@ from openai import OpenAI
 MAX_OUTPUT_CHARS = 8000  # Truncate long command output to protect context window
 MAX_HISTORY_MESSAGES = 80  # Trim older messages to stay within context limits
 DEFAULT_LOG_DIR = os.path.join(Path.home(), ".sysadmin-ai", "logs")
+_IS_WINDOWS = platform.system() == "Windows"
 
 # Provider presets: (base_url, default_model, env_key_var)
 PROVIDERS = {
@@ -176,6 +178,8 @@ def parse_args():
     parser.add_argument("--api-key", help="Override API key")
     parser.add_argument("--model", help="Override model name")
     parser.add_argument("--log-dir", help=f"Override log directory (default: {DEFAULT_LOG_DIR})")
+    parser.add_argument("--safe-mode", action="store_true", default=False,
+        help="Run commands inside a Docker container instead of directly on the host")
     return parser.parse_args()
 
 # --- COMMAND SAFETY ---
@@ -265,6 +269,195 @@ def check_command_safety(command):
     return "safe", None
 
 
+# --- EXECUTOR ABSTRACTION ---
+
+class Executor(ABC):
+    """Strategy interface for command execution."""
+
+    @abstractmethod
+    def execute(self, command, cwd=None):
+        """Returns (output, status, new_cwd)."""
+        ...
+
+    def cleanup(self):
+        pass
+
+
+class HostExecutor(Executor):
+    """Executes commands directly on the host via subprocess."""
+
+    _SENTINEL = "__SYSADMIN_AI_PWD__"
+
+    @staticmethod
+    def _needs_powershell_wrap(command):
+        """Detect bare PowerShell cmdlets that need wrapping for cmd.exe.
+
+        On Windows, shell=True runs through cmd.exe. PowerShell cmdlets like
+        Get-Process, Get-Service, etc. must be wrapped with 'powershell -command'
+        to execute correctly.  Commands already prefixed with 'powershell' or
+        'pwsh' are left untouched.
+        """
+        if not _IS_WINDOWS:
+            return False
+        stripped = command.strip()
+        # Already wrapped — nothing to do
+        if re.match(r"(?i)^(powershell|pwsh)\b", stripped):
+            return False
+        # Heuristic: line starts with a known Verb-Noun PowerShell cmdlet pattern
+        if re.match(r"^[A-Z][a-z]+-[A-Z][a-zA-Z]+", stripped):
+            return True
+        return False
+
+    def execute(self, command, cwd=None):
+        """Executes a command and returns (output, status, new_cwd).
+
+        Appends a pwd sentinel after the command to track directory changes.
+        ``new_cwd`` is the working directory after the command ran, or None if
+        it could not be determined.
+        """
+        # Auto-wrap bare PowerShell cmdlets so they work under cmd.exe
+        if self._needs_powershell_wrap(command):
+            command = f'powershell -NoProfile -Command "{command}"'
+
+        print(f"\033[93m[EXEC]\033[0m {command}")
+        # Append a sentinel + pwd so we can capture the cwd after the command,
+        # even if the command itself calls cd.
+        if _IS_WINDOWS:
+            # On Windows, \r\n chaining does NOT work under cmd.exe /c — only
+            # the first line runs.  Use & (unconditional chaining) instead.
+            # To preserve the command's exit status we use && / || to encode
+            # success (0) or failure (1) in the sentinel output.
+            wrapped = (
+                f"{command} "
+                f"&& (echo {self._SENTINEL}_0 & cd) "
+                f"|| (echo {self._SENTINEL}_1 & cd)"
+            )
+        else:
+            # Use && / || to encode exit status in the sentinel, matching
+            # the Windows format so the parsing logic is identical.
+            wrapped = (
+                f"({command}) "
+                f"&& echo {self._SENTINEL}_0 "
+                f"|| echo {self._SENTINEL}_1\n"
+                f"pwd"
+            )
+        try:
+            result = subprocess.run(
+                wrapped, shell=True, capture_output=True, timeout=30,
+                cwd=cwd, encoding="utf-8", errors="replace",
+            )
+            stdout = result.stdout or ""
+            stderr = result.stderr or ""
+            new_cwd = None
+            cmd_failed = False
+
+            # Extract the post-command cwd and exit status from the sentinel
+            if self._SENTINEL in stdout:
+                before, _, after = stdout.partition(self._SENTINEL)
+                lines = after.strip().split("\n")
+                # First token after sentinel is _0 (success) or _1 (failure)
+                status_token = lines[0].strip() if lines else ""
+                if status_token == "_1":
+                    cmd_failed = True
+                # Next line is the cwd from the 'cd' / 'pwd' command
+                if len(lines) > 1:
+                    pwd_line = lines[1].strip()
+                    if pwd_line and os.path.isabs(pwd_line):
+                        new_cwd = pwd_line
+                stdout = before  # Remove the sentinel and pwd from visible output
+
+            output = stdout + stderr
+            if not output.strip():
+                output = "(No output)"
+            elif len(output) > MAX_OUTPUT_CHARS:
+                output = output[:MAX_OUTPUT_CHARS] + f"\n... (truncated, {len(output)} chars total)"
+
+            # Both platforms encode exit status in the sentinel (_0 / _1),
+            # which is more reliable than result.returncode (always reflects
+            # the last chained command, not the user's command).
+            status = "exit_1" if cmd_failed else "success"
+            return output, status, new_cwd
+        except subprocess.TimeoutExpired:
+            return "Error: Command timed out after 30 seconds.", "timeout", None
+        except Exception as e:
+            return f"Error executing command: {str(e)}", "error", None
+
+
+class DockerExecutor(Executor):
+    """Runs commands inside a disposable Docker container (--safe-mode)."""
+
+    _SENTINEL = "__DOCKER_PWD__"
+
+    def __init__(self):
+        # Verify Docker is available
+        try:
+            subprocess.run(
+                ["docker", "info"], capture_output=True, check=True, timeout=10,
+            )
+        except FileNotFoundError:
+            raise RuntimeError(
+                "Docker is not installed. Install Docker to use --safe-mode."
+            )
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"Docker is not running or not accessible: {e.stderr or e}"
+            )
+
+        self._container = f"sysadmin-ai-{SESSION_ID}"
+        subprocess.run(
+            ["docker", "run", "-d", "--name", self._container,
+             "ubuntu:22.04", "sleep", "infinity"],
+            capture_output=True, check=True, timeout=60,
+        )
+
+    def execute(self, command, cwd=None):
+        """Executes a command inside the Docker container."""
+        cwd = cwd or "/root"
+        # Append pwd to track directory changes
+        wrapped = f"({command})\necho {self._SENTINEL}\npwd"
+        print(f"\033[93m[EXEC container]\033[0m {command}")
+        try:
+            result = subprocess.run(
+                ["docker", "exec", "--workdir", cwd, self._container,
+                 "sh", "-c", wrapped],
+                capture_output=True, timeout=30,
+                encoding="utf-8", errors="replace",
+            )
+            stdout = result.stdout or ""
+            stderr = result.stderr or ""
+            new_cwd = None
+
+            if self._SENTINEL in stdout:
+                before, _, after = stdout.partition(self._SENTINEL)
+                pwd_line = after.strip().split("\n")[0].strip()
+                if pwd_line and os.path.isabs(pwd_line):
+                    new_cwd = pwd_line
+                stdout = before
+
+            output = stdout + stderr
+            if not output.strip():
+                output = "(No output)"
+            elif len(output) > MAX_OUTPUT_CHARS:
+                output = output[:MAX_OUTPUT_CHARS] + f"\n... (truncated, {len(output)} chars total)"
+
+            status = "exit_1" if result.returncode != 0 else "success"
+            return output, status, new_cwd
+        except subprocess.TimeoutExpired:
+            return "Error: Command timed out after 30 seconds.", "timeout", None
+        except Exception as e:
+            return f"Error executing command: {str(e)}", "error", None
+
+    def cleanup(self):
+        """Remove the Docker container."""
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", self._container],
+                capture_output=True, timeout=15,
+            )
+        except Exception:
+            pass
+
+
 def load_safety_rules():
     """Load soul.md safety rules to include in the system prompt."""
     soul_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "soul.md")
@@ -287,7 +480,6 @@ def get_system_context():
     )
 
 # --- TOOLS ---
-_IS_WINDOWS = platform.system() == "Windows"
 
 _TOOL_EXAMPLES = (
     "e.g., 'systeminfo', 'Get-Process', 'dir', 'tasklist'"
@@ -318,97 +510,19 @@ tools = [
     }
 ]
 
-CWD_SENTINEL = "__SYSADMIN_AI_PWD__"
+# --- Backward-compatible wrappers (preserve test imports) ---
+CWD_SENTINEL = HostExecutor._SENTINEL
 
 
 def _needs_powershell_wrap(command):
-    """Detect bare PowerShell cmdlets that need wrapping for cmd.exe.
+    return HostExecutor._needs_powershell_wrap(command)
 
-    On Windows, shell=True runs through cmd.exe. PowerShell cmdlets like
-    Get-Process, Get-Service, etc. must be wrapped with 'powershell -command'
-    to execute correctly.  Commands already prefixed with 'powershell' or
-    'pwsh' are left untouched.
-    """
-    if not _IS_WINDOWS:
-        return False
-    stripped = command.strip()
-    # Already wrapped — nothing to do
-    if re.match(r"(?i)^(powershell|pwsh)\b", stripped):
-        return False
-    # Heuristic: line starts with a known Verb-Noun PowerShell cmdlet pattern
-    if re.match(r"^[A-Z][a-z]+-[A-Z][a-zA-Z]+", stripped):
-        return True
-    return False
+
+_host_executor = HostExecutor()
 
 
 def run_shell_command(command, cwd=None):
-    """Executes a command and returns (output, status, new_cwd).
-
-    Appends a pwd sentinel after the command to track directory changes.
-    ``new_cwd`` is the working directory after the command ran, or None if
-    it could not be determined.
-    """
-    # Auto-wrap bare PowerShell cmdlets so they work under cmd.exe
-    if _needs_powershell_wrap(command):
-        command = f'powershell -NoProfile -Command "{command}"'
-
-    print(f"\033[93m[EXEC]\033[0m {command}")
-    # Append a sentinel + pwd so we can capture the cwd after the command,
-    # even if the command itself calls cd.
-    if _IS_WINDOWS:
-        # On Windows, \r\n chaining does NOT work under cmd.exe /c — only
-        # the first line runs.  Use & (unconditional chaining) instead.
-        # To preserve the command's exit status we use && / || to encode
-        # success (0) or failure (1) in the sentinel output.
-        wrapped = (
-            f"{command} "
-            f"&& (echo {CWD_SENTINEL}_0 & cd) "
-            f"|| (echo {CWD_SENTINEL}_1 & cd)"
-        )
-    else:
-        wrapped = f"{command}\n__exit=$?\necho {CWD_SENTINEL}\npwd\nexit $__exit"
-    try:
-        result = subprocess.run(
-            wrapped, shell=True, capture_output=True, timeout=30,
-            cwd=cwd, encoding="utf-8", errors="replace",
-        )
-        stdout = result.stdout or ""
-        stderr = result.stderr or ""
-        new_cwd = None
-        cmd_failed = False
-
-        # Extract the post-command cwd and exit status from the sentinel
-        if CWD_SENTINEL in stdout:
-            before, _, after = stdout.partition(CWD_SENTINEL)
-            lines = after.strip().split("\n")
-            # First token after sentinel is _0 (success) or _1 (failure)
-            status_token = lines[0].strip() if lines else ""
-            if status_token == "_1":
-                cmd_failed = True
-            # Next line is the cwd from the 'cd' / 'pwd' command
-            if len(lines) > 1:
-                pwd_line = lines[1].strip()
-                if pwd_line and os.path.isabs(pwd_line):
-                    new_cwd = pwd_line
-            stdout = before  # Remove the sentinel and pwd from visible output
-
-        output = stdout + stderr
-        if not output.strip():
-            output = "(No output)"
-        elif len(output) > MAX_OUTPUT_CHARS:
-            output = output[:MAX_OUTPUT_CHARS] + f"\n... (truncated, {len(output)} chars total)"
-
-        if _IS_WINDOWS:
-            # Use the sentinel-encoded exit status (more reliable than
-            # result.returncode which reflects the last chained command).
-            status = "exit_1" if cmd_failed else "success"
-        else:
-            status = "success" if result.returncode == 0 else f"exit_{result.returncode}"
-        return output, status, new_cwd
-    except subprocess.TimeoutExpired:
-        return "Error: Command timed out after 30 seconds.", "timeout", None
-    except Exception as e:
-        return f"Error executing command: {str(e)}", "error", None
+    return _host_executor.execute(command, cwd=cwd)
 
 def trim_message_history(messages):
     """Trim old messages to stay within context limits.
@@ -443,12 +557,19 @@ def chat_loop():
     client, model_name, base_url = build_client(args)
     logger = setup_logging(args.log_dir)
 
+    if args.safe_mode:
+        executor = DockerExecutor()
+    else:
+        executor = HostExecutor()
+
     log_event(logger, "session_start", {
         "provider": args.provider,
         "model": model_name,
         "base_url": base_url,
         "os": f"{platform.system()} {platform.release()}",
         "user": os.environ.get("USER") or os.environ.get("USERNAME", "unknown"),
+        "executor": type(executor).__name__,
+        "safe_mode": args.safe_mode,
     })
 
     safety_rules = load_safety_rules()
@@ -490,6 +611,8 @@ def chat_loop():
 
     print(f"\033[92m[SysAdmin AI Connected]\033[0m provider=\033[96m{args.provider}\033[0m model=\033[96m{model_name}\033[0m")
     print(f"\033[90m  endpoint: {base_url}\033[0m")
+    if args.safe_mode:
+        print("\033[93m[SAFE MODE]\033[0m Commands run inside Docker container")
 
     while True:
         try:
@@ -553,7 +676,7 @@ def chat_loop():
                             except (KeyboardInterrupt, EOFError):
                                 answer = "n"
                             if answer == "y":
-                                cmd_result, status, new_cwd = run_shell_command(cmd, cwd=shell_state["cwd"])
+                                cmd_result, status, new_cwd = executor.execute(cmd, cwd=shell_state["cwd"])
                                 if new_cwd:
                                     shell_state["cwd"] = new_cwd
                                 log_event(logger, "tool_result", {
@@ -570,7 +693,7 @@ def chat_loop():
                                     "tool_call_id": tool_call.id,
                                 })
                         else:
-                            cmd_result, status, new_cwd = run_shell_command(cmd, cwd=shell_state["cwd"])
+                            cmd_result, status, new_cwd = executor.execute(cmd, cwd=shell_state["cwd"])
                             if new_cwd:
                                 shell_state["cwd"] = new_cwd
                             log_event(logger, "tool_result", {
@@ -611,6 +734,8 @@ def chat_loop():
         except Exception as e:
             print(f"\033[91m[ERROR]\033[0m API call failed: {e}")
             log_event(logger, "error", {"error": str(e), "type": type(e).__name__})
+
+    executor.cleanup()
 
 if __name__ == "__main__":
     chat_loop()
