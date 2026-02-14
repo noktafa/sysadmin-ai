@@ -156,14 +156,15 @@ File tools have their own safety checks, mirroring the shell command safety filt
 - `.ssh/id_*` (SSH private keys)
 - `/etc/ssh/ssh_host_*` (SSH host keys)
 - SAM database paths (Windows)
+- Keychain files (macOS)
 
 **Write safety** — two-tier blocked/confirm system:
 
 | Tier | Paths | Action |
 |------|-------|--------|
-| Blocked | `/bin/`, `/sbin/`, `/usr/bin/`, `/boot/`, `/proc/`, `/sys/`, `/dev/`, `C:\Windows\`, `C:\Program Files\` | Write rejected unconditionally |
+| Blocked | `/bin/`, `/sbin/`, `/usr/bin/`, `/boot/`, `/proc/`, `/sys/`, `/dev/`, `C:\Windows\`, `C:\Program Files\`, `/System/` (macOS), `/Library/Keychains/` (macOS) | Write rejected unconditionally |
 | Blocked | `/etc/passwd`, `/etc/shadow`, `/etc/fstab`, `/etc/gshadow`, `/etc/sudoers` | Write rejected unconditionally |
-| Confirm | `/etc/*` (other config files), `C:\ProgramData\*` | User prompted `y/N` before write |
+| Confirm | `/etc/*`, `C:\ProgramData\*`, `/Library/*` (macOS), `/Applications/*` (macOS) | User prompted `y/N` before write |
 | Confirm | Any existing file (overwrite) | User prompted `y/N` before write |
 | Safe | New files in non-system paths | Write proceeds immediately |
 

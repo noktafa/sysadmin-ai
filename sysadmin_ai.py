@@ -16,6 +16,7 @@ MAX_OUTPUT_CHARS = 8000  # Truncate long command output to protect context windo
 MAX_HISTORY_MESSAGES = 80  # Trim older messages to stay within context limits
 DEFAULT_LOG_DIR = os.path.join(Path.home(), ".sysadmin-ai", "logs")
 _IS_WINDOWS = platform.system() == "Windows"
+_IS_MACOS = platform.system() == "Darwin"
 
 # Provider presets: (base_url, default_model, env_key_var)
 PROVIDERS = {
@@ -585,6 +586,8 @@ def _check_read_safety(full_path):
     blocked_fragments = [".ssh/id_", "/etc/ssh/ssh_host_"]
     if _IS_WINDOWS:
         blocked_fragments += ["\\SAM", "/SAM"]
+    if _IS_MACOS:
+        blocked_fragments += ["/Library/Keychains/", "Keychains/login.keychain"]
 
     for exact in blocked_exact:
         if normalized == exact:
@@ -616,6 +619,8 @@ def _check_write_safety(full_path):
         blocked_prefixes += [
             "C:/Windows/", "C:/Program Files/", "C:/Program Files (x86)/",
         ]
+    if _IS_MACOS:
+        blocked_prefixes += ["/System/", "/Library/Keychains/"]
 
     for prefix in blocked_prefixes:
         if normalized.startswith(prefix):
@@ -627,6 +632,8 @@ def _check_write_safety(full_path):
     confirm_prefixes = ["/etc/"]
     if _IS_WINDOWS:
         confirm_prefixes += ["C:/ProgramData/"]
+    if _IS_MACOS:
+        confirm_prefixes += ["/Library/", "/Applications/"]
     for prefix in confirm_prefixes:
         if normalized.startswith(prefix):
             return "confirm", f"Writing to system config directory ({prefix})"
