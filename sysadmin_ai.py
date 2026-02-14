@@ -229,24 +229,47 @@ tools = [
     }
 ]
 
-def run_shell_command(command):
-    """Executes a command and returns (output, status) where status is
-    'success', 'timeout', or 'error'."""
+CWD_SENTINEL = "__SYSADMIN_AI_PWD__"
+
+
+def run_shell_command(command, cwd=None):
+    """Executes a command and returns (output, status, new_cwd).
+
+    Appends a pwd sentinel after the command to track directory changes.
+    ``new_cwd`` is the working directory after the command ran, or None if
+    it could not be determined.
+    """
     print(f"\033[93m[EXEC]\033[0m {command}")
+    # Append a sentinel + pwd so we can capture the cwd after the command,
+    # even if the command itself calls cd.
+    wrapped = f"{command}\n__exit=$?\necho {CWD_SENTINEL}\npwd\nexit $__exit"
     try:
         result = subprocess.run(
-            command, shell=True, text=True, capture_output=True, timeout=30
+            wrapped, shell=True, text=True, capture_output=True, timeout=30,
+            cwd=cwd,
         )
-        output = result.stdout + result.stderr
+        stdout = result.stdout
+        new_cwd = None
+
+        # Extract the post-command cwd from the sentinel
+        if CWD_SENTINEL in stdout:
+            before, _, after = stdout.partition(CWD_SENTINEL)
+            pwd_line = after.strip().split("\n")[0].strip()
+            if pwd_line and os.path.isabs(pwd_line):
+                new_cwd = pwd_line
+            stdout = before  # Remove the sentinel and pwd from visible output
+
+        output = stdout + result.stderr
         if not output.strip():
             output = "(No output)"
         elif len(output) > MAX_OUTPUT_CHARS:
             output = output[:MAX_OUTPUT_CHARS] + f"\n... (truncated, {len(output)} chars total)"
-        return output, "success" if result.returncode == 0 else f"exit_{result.returncode}"
+        status = "success" if result.returncode == 0 else f"exit_{result.returncode}"
+        return output, status, new_cwd
     except subprocess.TimeoutExpired:
-        return "Error: Command timed out after 30 seconds.", "timeout"
+        return "Error: Command timed out after 30 seconds.", "timeout", None
     except Exception as e:
-        return f"Error executing command: {str(e)}", "error"
+        return f"Error executing command: {str(e)}", "error", None
 
 # --- CHAT LOOP ---
 def chat_loop():
@@ -278,6 +301,9 @@ def chat_loop():
         {"role": "user", "content": "I am ready. " + get_system_context()}
     ]
 
+    # Shell state tracking — cwd persists across commands
+    shell_state = {"cwd": str(Path.home())}
+
     print(f"\033[92m[SysAdmin AI Connected]\033[0m provider=\033[96m{args.provider}\033[0m model=\033[96m{model_name}\033[0m")
     print(f"\033[90m  endpoint: {base_url}\033[0m")
 
@@ -292,7 +318,7 @@ def chat_loop():
             break
 
         log_event(logger, "user_input", {"message": user_input})
-        messages.append({"role": "user", "content": f"(CWD: {os.getcwd()}) {user_input}"})
+        messages.append({"role": "user", "content": f"(CWD: {shell_state['cwd']}) {user_input}"})
 
         try:
             # Request completion with tool support
@@ -340,10 +366,13 @@ def chat_loop():
                             except (KeyboardInterrupt, EOFError):
                                 answer = "n"
                             if answer == "y":
-                                cmd_result, status = run_shell_command(cmd)
+                                cmd_result, status, new_cwd = run_shell_command(cmd, cwd=shell_state["cwd"])
+                                if new_cwd:
+                                    shell_state["cwd"] = new_cwd
                                 log_event(logger, "tool_result", {
                                     "command": cmd, "output": cmd_result,
-                                    "status": status, "tool_call_id": tool_call.id,
+                                    "status": status, "cwd": shell_state["cwd"],
+                                    "tool_call_id": tool_call.id,
                                 })
                             else:
                                 cmd_result = f"DENIED: User rejected this command — {reason}."
@@ -354,10 +383,13 @@ def chat_loop():
                                     "tool_call_id": tool_call.id,
                                 })
                         else:
-                            cmd_result, status = run_shell_command(cmd)
+                            cmd_result, status, new_cwd = run_shell_command(cmd, cwd=shell_state["cwd"])
+                            if new_cwd:
+                                shell_state["cwd"] = new_cwd
                             log_event(logger, "tool_result", {
                                 "command": cmd, "output": cmd_result,
-                                "status": status, "tool_call_id": tool_call.id,
+                                "status": status, "cwd": shell_state["cwd"],
+                                "tool_call_id": tool_call.id,
                             })
                     else:
                         cmd_result = f"Error: Unknown tool '{tool_call.function.name}'"

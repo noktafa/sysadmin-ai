@@ -24,6 +24,38 @@ python3 sysadmin_ai.py [OPTIONS]
 - `SYSADMIN_AI_API_BASE` — API base URL override
 - `SYSADMIN_AI_MODEL` — Model name override
 
+## Persistent Shell State
+
+By default, each command the AI runs executes in an isolated subprocess — meaning `cd`, `export`, and other stateful shell operations would be lost between turns. SysAdmin AI solves this with **Python-side CWD tracking** that gives the AI the feel of a persistent shell without the security risks of a live PTY.
+
+### How it works
+
+1. The session maintains a `shell_state` dictionary (starting `cwd` at `$HOME`).
+2. Every command is executed via `subprocess.run(command, cwd=shell_state["cwd"])`, so the working directory carries over between commands.
+3. After each command, a hidden sentinel + `pwd` is appended to capture the resulting directory. If the command includes `cd /some/path`, the new directory is detected and stored for the next command.
+4. The sentinel and `pwd` output are stripped — they never appear in the AI's or user's view.
+5. On timeout or error, the last known `cwd` is preserved.
+
+### Example multi-turn session
+
+```
+You: list files in /var/log
+AI:  [runs: ls /var/log]  →  cwd is now /var/log (if command cd'd there)
+
+You: now check disk usage here
+AI:  [runs: du -sh *]     →  runs in /var/log, not $HOME
+```
+
+### What is NOT tracked
+
+- **Environment variables** — `export FOO=bar` in one command will not persist to the next. This is intentional; tracking arbitrary env mutations requires shell-level parsing and opens attack surface.
+- **Shell aliases, functions, and traps** — each command still runs in a fresh shell process.
+- **Background jobs** — no job control is carried between commands.
+
+### Why not a persistent PTY?
+
+A persistent shell (via `pexpect` or PTY) accumulates hidden state, makes timeout handling fragile, and allows multi-step safety filter bypasses (e.g., setting an alias in turn 1, exploiting it in turn 2). The CWD-tracking approach covers the most common use case (`cd` persistence) with none of these risks.
+
 ## Command Safety Filter
 
 Every command the LLM requests goes through a two-tier safety check before execution:
@@ -50,7 +82,7 @@ python3 sysadmin_ai.py --log-dir /tmp/ai-logs
 | `session_start` | Provider, model, base URL, OS, user |
 | `user_input` | The user's message |
 | `tool_call` | Command the LLM wants to run, plus its reasoning |
-| `tool_result` | Command output and exit status |
+| `tool_result` | Command output, exit status, and current working directory |
 | `llm_final_response` | The LLM's response after processing tool results |
 | `command_blocked` | Command rejected by the safety blocklist |
 | `command_denied` | Command rejected by the user (graylist prompt) |
@@ -72,6 +104,13 @@ python3 sysadmin_ai.py --log-dir /tmp/ai-logs
 ```
 
 ## Release Notes
+
+### v0.6.0
+
+- **Persistent working directory** — the AI's shell now remembers `cd` across commands via Python-side CWD tracking. Each command runs with `subprocess.run(cwd=tracked_cwd)` and a post-command `pwd` sentinel captures directory changes.
+- **`shell_state` tracking** — session maintains a state dict starting at `$HOME`. The tracked `cwd` is passed in every user message and logged in `tool_result` events.
+- **Sentinel-based pwd capture** — a hidden `__SYSADMIN_AI_PWD__` marker is appended after each command to detect directory changes. The sentinel and its output are stripped from all visible output.
+- **`run_shell_command` returns 3-tuple** — now returns `(output, status, new_cwd)` instead of `(output, status)`. `new_cwd` is `None` on timeout/error, preserving the last known directory.
 
 ### v0.5.0
 
