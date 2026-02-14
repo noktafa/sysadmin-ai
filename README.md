@@ -32,9 +32,29 @@ By default, each command the AI runs executes in an isolated subprocess — mean
 
 1. The session maintains a `shell_state` dictionary (starting `cwd` at `$HOME`).
 2. Every command is executed via `subprocess.run(command, cwd=shell_state["cwd"])`, so the working directory carries over between commands.
-3. After each command, a hidden sentinel + `pwd` is appended to capture the resulting directory. If the command includes `cd /some/path`, the new directory is detected and stored for the next command.
-4. The sentinel and `pwd` output are stripped — they never appear in the AI's or user's view.
+3. After each command, a hidden sentinel is appended to capture the resulting directory. On Linux/macOS it uses `pwd`; on Windows it uses `cd` (via `&` chaining — see below).
+4. The sentinel output is stripped — it never appears in the AI's or user's view.
 5. On timeout or error, the last known `cwd` is preserved.
+
+### Windows command chaining
+
+On Windows, `subprocess.run(shell=True)` invokes `cmd.exe /c`. Newline (`\r\n`) chaining does **not** work under `cmd.exe /c` — only the first line executes. SysAdmin AI uses `&` chaining with `&&`/`||` to run the sentinel commands and preserve the original command's exit status:
+
+```
+{command} && (echo SENTINEL_0 & cd) || (echo SENTINEL_1 & cd)
+```
+
+The `_0` / `_1` suffix encodes success or failure, since `result.returncode` would otherwise always reflect the last chained command (`cd`), not the user's command.
+
+### Auto-wrapping PowerShell cmdlets
+
+On Windows, `shell=True` runs commands through `cmd.exe`, not PowerShell. If the LLM sends a bare PowerShell cmdlet like `Get-Process`, it will fail with "not recognized". SysAdmin AI auto-detects bare cmdlets using the `Verb-Noun` naming pattern and wraps them:
+
+```
+Get-Process | Sort-Object CPU   →   powershell -NoProfile -Command "Get-Process | Sort-Object CPU"
+```
+
+Commands already prefixed with `powershell` or `pwsh` are left untouched.
 
 ### Example multi-turn session
 
@@ -125,6 +145,14 @@ python3 sysadmin_ai.py --log-dir /tmp/ai-logs
 ```
 
 ## Release Notes
+
+### v0.9.0
+
+- **Fix Windows encoding crash** — `systeminfo`, `Get-WinEvent`, and other commands that produce locale-specific output would crash with `argument of type 'NoneType' is not iterable`. Replaced `text=True` with explicit `encoding="utf-8", errors="replace"` and added null guards on `stdout`/`stderr`.
+- **Auto-wrap bare PowerShell cmdlets** — added `_needs_powershell_wrap()` to detect the `Verb-Noun` pattern (e.g. `Get-Process`, `Set-ExecutionPolicy`) and automatically wrap with `powershell -NoProfile -Command`. Skips commands already prefixed with `powershell` or `pwsh`. No-op on Linux/macOS.
+- **Fix Windows CWD tracking** — `\r\n` command chaining does not work under `cmd.exe /c` (only the first line runs). Replaced with `&` chaining using `&&`/`||` to encode the command's exit status in the sentinel output.
+- **Fix Windows exit code tracking** — with `&` chaining, `result.returncode` always reflects the last command (`cd`), not the user's command. Exit status is now parsed from the sentinel (`_0` for success, `_1` for failure).
+- **Improved Windows system prompt** — updated to instruct the LLM to always use `powershell -command` prefix for PowerShell cmdlets, with explicit warning that bare cmdlets don't work under cmd.exe.
 
 ### v0.8.0
 
