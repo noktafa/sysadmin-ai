@@ -258,6 +258,26 @@ tools = [
 CWD_SENTINEL = "__SYSADMIN_AI_PWD__"
 
 
+def _needs_powershell_wrap(command):
+    """Detect bare PowerShell cmdlets that need wrapping for cmd.exe.
+
+    On Windows, shell=True runs through cmd.exe. PowerShell cmdlets like
+    Get-Process, Get-Service, etc. must be wrapped with 'powershell -command'
+    to execute correctly.  Commands already prefixed with 'powershell' or
+    'pwsh' are left untouched.
+    """
+    if not _IS_WINDOWS:
+        return False
+    stripped = command.strip()
+    # Already wrapped — nothing to do
+    if re.match(r"(?i)^(powershell|pwsh)\b", stripped):
+        return False
+    # Heuristic: line starts with a known Verb-Noun PowerShell cmdlet pattern
+    if re.match(r"^[A-Z][a-z]+-[A-Z][a-zA-Z]+", stripped):
+        return True
+    return False
+
+
 def run_shell_command(command, cwd=None):
     """Executes a command and returns (output, status, new_cwd).
 
@@ -265,35 +285,62 @@ def run_shell_command(command, cwd=None):
     ``new_cwd`` is the working directory after the command ran, or None if
     it could not be determined.
     """
+    # Auto-wrap bare PowerShell cmdlets so they work under cmd.exe
+    if _needs_powershell_wrap(command):
+        command = f'powershell -NoProfile -Command "{command}"'
+
     print(f"\033[93m[EXEC]\033[0m {command}")
     # Append a sentinel + pwd so we can capture the cwd after the command,
     # even if the command itself calls cd.
     if _IS_WINDOWS:
-        wrapped = f"{command}\r\necho {CWD_SENTINEL}\r\ncd"
+        # On Windows, \r\n chaining does NOT work under cmd.exe /c — only
+        # the first line runs.  Use & (unconditional chaining) instead.
+        # To preserve the command's exit status we use && / || to encode
+        # success (0) or failure (1) in the sentinel output.
+        wrapped = (
+            f"{command} "
+            f"&& (echo {CWD_SENTINEL}_0 & cd) "
+            f"|| (echo {CWD_SENTINEL}_1 & cd)"
+        )
     else:
         wrapped = f"{command}\n__exit=$?\necho {CWD_SENTINEL}\npwd\nexit $__exit"
     try:
         result = subprocess.run(
-            wrapped, shell=True, text=True, capture_output=True, timeout=30,
-            cwd=cwd,
+            wrapped, shell=True, capture_output=True, timeout=30,
+            cwd=cwd, encoding="utf-8", errors="replace",
         )
-        stdout = result.stdout
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
         new_cwd = None
+        cmd_failed = False
 
-        # Extract the post-command cwd from the sentinel
+        # Extract the post-command cwd and exit status from the sentinel
         if CWD_SENTINEL in stdout:
             before, _, after = stdout.partition(CWD_SENTINEL)
-            pwd_line = after.strip().split("\n")[0].strip()
-            if pwd_line and os.path.isabs(pwd_line):
-                new_cwd = pwd_line
+            lines = after.strip().split("\n")
+            # First token after sentinel is _0 (success) or _1 (failure)
+            status_token = lines[0].strip() if lines else ""
+            if status_token == "_1":
+                cmd_failed = True
+            # Next line is the cwd from the 'cd' / 'pwd' command
+            if len(lines) > 1:
+                pwd_line = lines[1].strip()
+                if pwd_line and os.path.isabs(pwd_line):
+                    new_cwd = pwd_line
             stdout = before  # Remove the sentinel and pwd from visible output
 
-        output = stdout + result.stderr
+        output = stdout + stderr
         if not output.strip():
             output = "(No output)"
         elif len(output) > MAX_OUTPUT_CHARS:
             output = output[:MAX_OUTPUT_CHARS] + f"\n... (truncated, {len(output)} chars total)"
-        status = "success" if result.returncode == 0 else f"exit_{result.returncode}"
+
+        if _IS_WINDOWS:
+            # Use the sentinel-encoded exit status (more reliable than
+            # result.returncode which reflects the last chained command).
+            status = "exit_1" if cmd_failed else "success"
+        else:
+            status = "success" if result.returncode == 0 else f"exit_{result.returncode}"
         return output, status, new_cwd
     except subprocess.TimeoutExpired:
         return "Error: Command timed out after 30 seconds.", "timeout", None
@@ -325,7 +372,11 @@ def chat_loop():
     if os_name == "Windows":
         system_prompt += (
             "Use Windows commands (cmd.exe and PowerShell). "
-            "Examples: 'systeminfo', 'Get-Process', 'Get-Service', 'tasklist', 'wmic cpu get loadpercentage'. "
+            "IMPORTANT: For PowerShell cmdlets, always prefix with 'powershell -command', "
+            "e.g. 'powershell -command \"Get-Process\"'. "
+            "Bare cmdlets like 'Get-Process' will NOT work because the shell is cmd.exe. "
+            "Examples: 'systeminfo', 'powershell -command \"Get-Process\"', "
+            "'powershell -command \"Get-Service\"', 'tasklist', 'wmic cpu get loadpercentage'. "
         )
     else:
         system_prompt += (
