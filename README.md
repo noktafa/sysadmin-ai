@@ -144,7 +144,22 @@ python3 sysadmin_ai.py --log-dir /tmp/ai-logs
 }
 ```
 
+## Testing
+
+Run the full test suite:
+
+```bash
+python -m pytest tests/ -v
+```
+
+30 tests across 7 classes: safety filter, shell execution, PowerShell wrapping, Windows execution, CWD tracking, encoding, and message history trimming. One test (Unix `cd` tracking) is automatically skipped on Windows.
+
 ## Release Notes
+
+### v0.10.0
+
+- **Persistent test suite** — 30 tests across 7 classes (`TestSafetyFilter`, `TestRunShellCommand`, `TestNeedsPowershellWrap`, `TestWindowsExecution`, `TestCWDTracking`, `TestEncoding`, `TestTrimMessageHistory`) covering all core functionality. Run with `python -m pytest tests/ -v`.
+- **Message history trimming** — new `trim_message_history()` function caps the conversation at `MAX_HISTORY_MESSAGES = 80` messages to prevent context window overflow on long sessions. The system prompt is always preserved, and a trim notice is injected so the LLM knows earlier context was dropped.
 
 ### v0.9.0
 
