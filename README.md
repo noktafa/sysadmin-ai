@@ -131,7 +131,41 @@ Safety rules from `soul.md` (if present in the script directory) are loaded into
 - **Linux / macOS** — destructive ops, system sabotage, firewall, privilege escalation, kernel/boot
 - **macOS-Specific** — SIP, nvram, `/System` protections
 - **Windows** — format, diskpart, registry, SAM, Defender, UAC, firewall
+- **File I/O Tools** — prefer `read_file`/`write_file` over shell, blocked write paths, read-before-write
 - **Required Behavior** — OS-appropriate safe practices (`--dry-run` on Unix, `-WhatIf` on PowerShell)
+
+## Native File I/O Tools
+
+In addition to shell commands, the AI has dedicated `read_file` and `write_file` tools that use Python I/O directly. These bypass the shell entirely, eliminating quoting/escaping issues that plague `echo "content" > file.conf` and `cat` with unusual encodings.
+
+| Tool | What it does | Why it's better than shell |
+|------|-------------|---------------------------|
+| `read_file` | Reads a file via Python `open()` | No encoding crashes, handles binary detection, truncates large files |
+| `write_file` | Writes content via Python `open()` | No shell escaping — quotes, backticks, and backslashes are written verbatim |
+
+Both tools resolve relative paths against the tracked CWD (`shell_state["cwd"]`), so `cd /etc` followed by `read_file nginx/nginx.conf` reads `/etc/nginx/nginx.conf`.
+
+The system prompt instructs the AI to prefer these tools over `cat`/`echo >` for file operations.
+
+### File I/O safety
+
+File tools have their own safety checks, mirroring the shell command safety filter:
+
+**Read safety** — blocks reading credential files that the shell blocklist also protects:
+- `/etc/shadow`, `/etc/gshadow` (password hashes)
+- `.ssh/id_*` (SSH private keys)
+- `/etc/ssh/ssh_host_*` (SSH host keys)
+- SAM database paths (Windows)
+
+**Write safety** — two-tier blocked/confirm system:
+
+| Tier | Paths | Action |
+|------|-------|--------|
+| Blocked | `/bin/`, `/sbin/`, `/usr/bin/`, `/boot/`, `/proc/`, `/sys/`, `/dev/`, `C:\Windows\`, `C:\Program Files\` | Write rejected unconditionally |
+| Blocked | `/etc/passwd`, `/etc/shadow`, `/etc/fstab`, `/etc/gshadow`, `/etc/sudoers` | Write rejected unconditionally |
+| Confirm | `/etc/*` (other config files), `C:\ProgramData\*` | User prompted `y/N` before write |
+| Confirm | Any existing file (overwrite) | User prompted `y/N` before write |
+| Safe | New files in non-system paths | Write proceeds immediately |
 
 ## Structured JSON Logging
 
@@ -165,6 +199,9 @@ python3 sysadmin_ai.py --log-dir /tmp/ai-logs
 | `llm_final_response` | The LLM's response after processing tool results |
 | `command_blocked` | Command rejected by the safety blocklist |
 | `command_denied` | Command rejected by the user (graylist prompt) |
+| `read_blocked` | File read rejected by the read safety filter |
+| `write_blocked` | File write rejected by the write safety filter |
+| `write_denied` | File write rejected by the user (graylist prompt) |
 | `error` | API failures or other exceptions |
 
 ### Example log entry
@@ -193,6 +230,13 @@ python -m pytest tests/ -v
 54 tests across 8 classes: safety filter, shell execution, PowerShell wrapping, Windows execution, CWD tracking, encoding, message history trimming, and log redaction. One test (Unix `cd` tracking) is automatically skipped on Windows.
 
 ## Release Notes
+
+### v0.12.0
+
+- **Native file I/O tools** — new `read_file` and `write_file` tools give the AI safe file operations via Python I/O, bypassing the shell entirely. No more quoting/escaping issues when editing config files. The system prompt instructs the LLM to prefer these over `cat`/`echo >`.
+- **Read safety filter** — `read_file` blocks access to credential files (`/etc/shadow`, SSH private keys, SAM database), mirroring the shell blocklist's credential access protections so `read_file` cannot bypass them.
+- **Write safety filter** — `write_file` uses the same blocked/confirm/safe pattern as shell commands. Writes to system binaries (`/bin/`, `C:\Windows\`) are unconditionally blocked. Writes to `/etc/` config and overwrites of existing files require `y/N` confirmation. New files in non-system paths proceed immediately.
+- **New log events** — `read_blocked`, `write_blocked`, and `write_denied` events for file I/O safety audit trail.
 
 ### v0.11.0
 

@@ -507,7 +507,53 @@ tools = [
                 "required": ["command"]
             }
         }
-    }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": (
+                "Read the contents of a file using Python I/O. "
+                "More reliable than 'cat' — handles encoding safely. "
+                "Use for reading config files, logs, and scripts."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The file path to read (absolute or relative to CWD)."
+                    }
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": (
+                "Write content to a file using Python I/O. "
+                "More reliable than 'echo >' — no shell escaping issues. "
+                "Use for editing config files and creating scripts."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The destination file path (absolute or relative to CWD)."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The exact content to write to the file."
+                    }
+                },
+                "required": ["path", "content"]
+            }
+        }
+    },
 ]
 
 # --- Backward-compatible wrappers (preserve test imports) ---
@@ -523,6 +569,120 @@ _host_executor = HostExecutor()
 
 def run_shell_command(command, cwd=None):
     return _host_executor.execute(command, cwd=cwd)
+
+
+# --- FILE I/O TOOLS ---
+
+def _check_read_safety(full_path):
+    """Check if a file path is safe to read.
+
+    Returns:
+        ("blocked", reason) - read must not proceed
+        ("safe", None)      - read can proceed
+    """
+    normalized = full_path.replace("\\", "/")
+    blocked_exact = ["/etc/shadow", "/etc/gshadow"]
+    blocked_fragments = [".ssh/id_", "/etc/ssh/ssh_host_"]
+    if _IS_WINDOWS:
+        blocked_fragments += ["\\SAM", "/SAM"]
+
+    for exact in blocked_exact:
+        if normalized == exact:
+            return "blocked", f"Reading {exact} is blocked for safety"
+    for frag in blocked_fragments:
+        if frag in normalized:
+            return "blocked", f"Reading sensitive file matching '{frag}'"
+    return "safe", None
+
+
+def _check_write_safety(full_path):
+    """Check if a file path is safe to write to.
+
+    Returns:
+        ("blocked", reason) - write must not proceed
+        ("confirm", reason) - write needs user confirmation
+        ("safe", None)      - write can proceed
+    """
+    normalized = full_path.replace("\\", "/")
+    blocked_prefixes = [
+        "/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/",
+        "/boot/", "/proc/", "/sys/", "/dev/",
+    ]
+    blocked_exact = [
+        "/etc/passwd", "/etc/shadow", "/etc/fstab",
+        "/etc/gshadow", "/etc/sudoers",
+    ]
+    if _IS_WINDOWS:
+        blocked_prefixes += [
+            "C:/Windows/", "C:/Program Files/", "C:/Program Files (x86)/",
+        ]
+
+    for prefix in blocked_prefixes:
+        if normalized.startswith(prefix):
+            return "blocked", f"Writing to system path {prefix}"
+    for exact in blocked_exact:
+        if normalized == exact:
+            return "blocked", f"Writing to critical system file {exact}"
+
+    confirm_prefixes = ["/etc/"]
+    if _IS_WINDOWS:
+        confirm_prefixes += ["C:/ProgramData/"]
+    for prefix in confirm_prefixes:
+        if normalized.startswith(prefix):
+            return "confirm", f"Writing to system config directory ({prefix})"
+
+    if os.path.exists(full_path):
+        return "confirm", f"Overwriting existing file: {full_path}"
+
+    return "safe", None
+
+
+def read_file_content(path, cwd):
+    """Read a file using Python I/O.  Returns (content_or_error, status)."""
+    try:
+        full_path = os.path.abspath(os.path.join(cwd, os.path.expanduser(path)))
+
+        if not os.path.exists(full_path):
+            return f"Error: File not found: {full_path}", "error"
+        if os.path.isdir(full_path):
+            return f"Error: {full_path} is a directory, not a file.", "error"
+
+        try:
+            with open(full_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except UnicodeDecodeError:
+            return f"Error: File appears to be binary: {full_path}", "error"
+
+        if not content:
+            content = "(Empty file)"
+        elif len(content) > MAX_OUTPUT_CHARS:
+            content = content[:MAX_OUTPUT_CHARS] + f"\n... (truncated, {len(content)} chars total)"
+
+        return content, "success"
+    except PermissionError:
+        return f"Error: Permission denied: {full_path}", "error"
+    except Exception as e:
+        return f"Error reading file: {e}", "error"
+
+
+def write_file_content(path, content, cwd):
+    """Write content to a file using Python I/O.  Returns (message_or_error, status)."""
+    try:
+        full_path = os.path.abspath(os.path.join(cwd, os.path.expanduser(path)))
+
+        parent = os.path.dirname(full_path)
+        if parent and not os.path.exists(parent):
+            os.makedirs(parent, exist_ok=True)
+
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        return f"Successfully wrote {len(content)} chars to {full_path}", "success"
+    except PermissionError:
+        return f"Error: Permission denied: {full_path}", "error"
+    except Exception as e:
+        return f"Error writing file: {e}", "error"
+
 
 def trim_message_history(messages):
     """Trim old messages to stay within context limits.
@@ -595,8 +755,11 @@ def chat_loop():
             "Examples: 'top -bn1', 'df -h', 'ps aux', 'cat /var/log/syslog'. "
         )
     system_prompt += (
-        "When asked to analyze or fix something, USE THE TOOL to inspect the system state first. "
-        "Do not hallucinate file contents. Run commands to read them."
+        "You also have 'read_file' and 'write_file' tools for safe file I/O. "
+        "Prefer these over shell commands (cat, echo >) for reading and writing files — "
+        "they handle encoding and escaping correctly. "
+        "When asked to analyze or fix something, USE THE TOOLS to inspect the system state first. "
+        "Do not hallucinate file contents. Read them with read_file or shell commands."
     )
     if safety_rules:
         system_prompt += "\n\n" + safety_rules
@@ -701,9 +864,92 @@ def chat_loop():
                                 "status": status, "cwd": shell_state["cwd"],
                                 "tool_call_id": tool_call.id,
                             })
+                    elif tool_call.function.name == "read_file":
+                        tool_args = json.loads(tool_call.function.arguments)
+                        file_path = tool_args.get("path", "")
+                        full_path = os.path.abspath(
+                            os.path.join(shell_state["cwd"], os.path.expanduser(file_path))
+                        )
+
+                        log_event(logger, "tool_call", {
+                            "tool": "read_file", "path": file_path,
+                            "reasoning": reasoning,
+                            "tool_call_id": tool_call.id,
+                        })
+
+                        safety, reason = _check_read_safety(full_path)
+                        if safety == "blocked":
+                            cmd_result = f"BLOCKED: Read rejected by safety filter — {reason}."
+                            print(f"\033[91m[BLOCKED]\033[0m read_file {file_path}  ({reason})")
+                            log_event(logger, "read_blocked", {
+                                "path": file_path, "reason": reason,
+                                "tool_call_id": tool_call.id,
+                            })
+                        else:
+                            print(f"\033[93m[READ]\033[0m {full_path}")
+                            cmd_result, status = read_file_content(file_path, shell_state["cwd"])
+                            log_event(logger, "tool_result", {
+                                "tool": "read_file", "path": file_path,
+                                "output": cmd_result, "status": status,
+                                "tool_call_id": tool_call.id,
+                            })
+
+                    elif tool_call.function.name == "write_file":
+                        tool_args = json.loads(tool_call.function.arguments)
+                        file_path = tool_args.get("path", "")
+                        file_content = tool_args.get("content", "")
+                        full_path = os.path.abspath(
+                            os.path.join(shell_state["cwd"], os.path.expanduser(file_path))
+                        )
+
+                        log_event(logger, "tool_call", {
+                            "tool": "write_file", "path": file_path,
+                            "content_length": len(file_content),
+                            "reasoning": reasoning,
+                            "tool_call_id": tool_call.id,
+                        })
+
+                        safety, reason = _check_write_safety(full_path)
+                        if safety == "blocked":
+                            cmd_result = f"BLOCKED: Write rejected by safety filter — {reason}. Do NOT attempt this write again."
+                            print(f"\033[91m[BLOCKED]\033[0m write_file {file_path}  ({reason})")
+                            log_event(logger, "write_blocked", {
+                                "path": file_path, "reason": reason,
+                                "tool_call_id": tool_call.id,
+                            })
+                        elif safety == "confirm":
+                            print(f"\033[93m[WARNING]\033[0m write_file {file_path}")
+                            print(f"  Reason: {reason}")
+                            try:
+                                answer = input("  Allow this write? (y/N): ").strip().lower()
+                            except (KeyboardInterrupt, EOFError):
+                                answer = "n"
+                            if answer == "y":
+                                print(f"\033[93m[WRITE]\033[0m {full_path} ({len(file_content)} chars)")
+                                cmd_result, status = write_file_content(file_path, file_content, shell_state["cwd"])
+                                log_event(logger, "tool_result", {
+                                    "tool": "write_file", "path": file_path,
+                                    "output": cmd_result, "status": status,
+                                    "tool_call_id": tool_call.id,
+                                })
+                            else:
+                                cmd_result = f"DENIED: User rejected this write — {reason}."
+                                print(f"\033[91m[DENIED]\033[0m Write rejected by user.")
+                                log_event(logger, "write_denied", {
+                                    "path": file_path, "reason": reason,
+                                    "tool_call_id": tool_call.id,
+                                })
+                        else:
+                            print(f"\033[93m[WRITE]\033[0m {full_path} ({len(file_content)} chars)")
+                            cmd_result, status = write_file_content(file_path, file_content, shell_state["cwd"])
+                            log_event(logger, "tool_result", {
+                                "tool": "write_file", "path": file_path,
+                                "output": cmd_result, "status": status,
+                                "tool_call_id": tool_call.id,
+                            })
+
                     else:
                         cmd_result = f"Error: Unknown tool '{tool_call.function.name}'"
-                        status = "error"
 
                     messages.append({
                         "role": "tool",
