@@ -126,6 +126,42 @@ User Input
 - **30-second timeout** prevents runaway commands but won't stop a `rm -rf` from completing quickly. Consider running in a sandboxed environment or as a non-privileged user.
 - For production use, consider adding a command allowlist/blocklist.
 
+## Release Notes
+
+### v1.2.0 — Safety Layer
+
+- Added `soul.md` — a safety rules file that is loaded into the LLM system prompt on startup
+- Blocks destructive commands (`rm -rf /`, `mkfs`, `dd`, fork bombs)
+- Blocks credential/data exfiltration (`/etc/shadow`, SSH keys, secrets)
+- Blocks privilege escalation (`sudo su`, sudoers modification, SUID bits)
+- Blocks network attacks (reverse shells, `curl | bash`, firewall flushing)
+- Blocks kernel/boot tampering (`modprobe`, `/boot`, `/sys` writes)
+- Enforces read-before-write, explain-before-execute behavior
+- Refuses social engineering attempts to bypass rules
+- Script exits with error if `soul.md` is missing
+
+### v1.1.0 — Multi-Provider & Cross-Platform
+
+- Added OpenAI cloud API as a provider (`--provider openai`)
+- Added CLI arguments via `argparse`: `--provider`, `--api-base`, `--api-key`, `--model`
+- Config priority: CLI flag > environment variable > provider default
+- API key validation: exits with clear error if OpenAI provider has no key
+- Cross-platform support: replaced `uname -sr` with `platform` module
+- Added `USERNAME` env var fallback for Windows compatibility
+- Fixed variable shadowing bug: `args` was reused for both argparse and tool call JSON
+
+### v1.0.0 — Initial Release
+
+- Interactive CLI chatbot connecting to vLLM (OpenAI-compatible API)
+- LLM-driven shell command execution via function calling (tool use)
+- Multi-step reasoning: LLM can chain multiple commands in one turn
+- Parallel tool call support: multiple tool calls processed before next LLM call
+- Output truncation at 8000 characters to protect context window
+- 30-second command timeout
+- System context injection (OS, user, working directory)
+- Graceful exit handling (`Ctrl+C`, `EOF`, `exit`/`quit`)
+- Error recovery: API failures print error and continue the session
+
 ## Bugs Fixed (from original version)
 
 | # | Bug | Fix |
