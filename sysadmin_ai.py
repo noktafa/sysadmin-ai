@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import platform
 import argparse
 import subprocess
@@ -114,6 +115,88 @@ def parse_args():
     parser.add_argument("--log-dir", help=f"Override log directory (default: {DEFAULT_LOG_DIR})")
     return parser.parse_args()
 
+# --- COMMAND SAFETY ---
+
+# Commands that are ALWAYS blocked (never executed)
+BLOCKED_PATTERNS = [
+    # Destructive operations
+    (r"rm\s+(-[a-zA-Z]*)?r[a-zA-Z]*\s+/(\s|$|etc|usr|var|home|boot|sys|proc|dev)", "Recursive deletion of system directory"),
+    (r"\bmkfs\b", "Disk format operation"),
+    (r"\bdd\s+", "Raw disk write operation"),
+    (r"\bshred\b", "File shredding operation"),
+    (r"\bwipefs\b", "Filesystem signature wipe"),
+    (r"sgdisk\s+--zap", "Partition table destruction"),
+    (r":\(\)\s*\{.*\|.*&\s*\}\s*;", "Fork bomb"),
+    # System sabotage
+    (r"chmod\s+(-[a-zA-Z]*\s+)*(000|777)\s+.*(\/etc|\/usr|\/var|\/boot|\/sys|\/proc|\s+\/\s*$)", "Dangerous permission change on system directory"),
+    (r"chown\s+(-[a-zA-Z]*\s+)*\S+\s+/(etc|usr|var|boot|sys|proc)(\s|/|$)", "Ownership change on system directory"),
+    (r">\s*/etc/(passwd|shadow|fstab|hosts)", "Overwriting critical system file"),
+    (r"kill\s+(-[0-9]*\s+)?-?1$", "Killing init or all processes"),
+    (r"\b(shutdown|poweroff|halt)\b", "System shutdown/poweroff"),
+    (r"\binit\s+[06]\b", "System halt/reboot via init"),
+    # Network attacks
+    (r"curl\s+.*\|\s*(ba)?sh", "Remote script execution via curl"),
+    (r"wget\s+.*\|\s*(ba)?sh", "Remote script execution via wget"),
+    (r"bash\s+-i\s+.*>/dev/tcp", "Reverse shell attempt"),
+    (r"\bnc\s+.*-[a-zA-Z]*e\s+/(bin/)?(ba)?sh", "Netcat reverse shell"),
+    (r"mkfifo.*nc\s+", "Named pipe reverse shell"),
+    # Credential / data exfiltration
+    (r"cat\s+.*/etc/(shadow|gshadow)", "Reading password shadow file"),
+    (r"cat\s+.*\.ssh/id_", "Reading SSH private key"),
+    (r"cat\s+.*/etc/ssh/ssh_host_.*_key(\s|$)", "Reading SSH host private key"),
+    # Privilege escalation
+    (r"sudo\s+su(\s|$)", "Unrestricted root shell via sudo su"),
+    (r"sudo\s+(-\w+\s+)*bash", "Unrestricted root shell via sudo bash"),
+    (r"sudo\s+-i", "Unrestricted root shell via sudo -i"),
+    (r"chmod\s+[a-zA-Z]*u\+s", "Setting SUID bit"),
+    (r"chmod\s+[a-zA-Z]*g\+s", "Setting SGID bit"),
+    (r"visudo|.*>/etc/sudoers", "Modifying sudoers"),
+    # Kernel / boot tampering
+    (r"\b(modprobe|insmod|rmmod)\b", "Kernel module manipulation"),
+    (r">\s*/(boot|sys|proc)/", "Writing to boot/sys/proc"),
+    (r"\bgrub-install\b", "Bootloader modification"),
+]
+
+# Commands that require user confirmation before execution
+GRAYLIST_PATTERNS = [
+    (r"\breboot\b", "System reboot"),
+    (r"\bapt\s+(remove|purge)\b", "Package removal"),
+    (r"\byum\s+(remove|erase)\b", "Package removal"),
+    (r"\bsystemctl\s+(stop|disable|mask)\b", "Service stop/disable"),
+    (r"\brm\s+(-[a-zA-Z]*)?r", "Recursive file deletion"),
+    (r"\biptables\s+(-[a-zA-Z]*\s+)*-F", "Firewall rule flush"),
+    (r"\bufw\s+disable\b", "Firewall disable"),
+    (r"\bmv\s+/etc/", "Moving system config file"),
+]
+
+
+def check_command_safety(command):
+    """Check a command against blocklist and graylist.
+
+    Returns:
+        ("blocked", reason) - command must not run
+        ("confirm", reason) - command needs user confirmation
+        ("safe", None)      - command can run freely
+    """
+    for pattern, reason in BLOCKED_PATTERNS:
+        if re.search(pattern, command):
+            return "blocked", reason
+    for pattern, reason in GRAYLIST_PATTERNS:
+        if re.search(pattern, command):
+            return "confirm", reason
+    return "safe", None
+
+
+def load_safety_rules():
+    """Load soul.md safety rules to include in the system prompt."""
+    soul_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "soul.md")
+    try:
+        with open(soul_path, "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+
 # --- SYSTEM CONTEXT ---
 def get_system_context():
     """Gathers current system info to feed the LLM."""
@@ -179,17 +262,19 @@ def chat_loop():
         "user": os.environ.get("USER") or os.environ.get("USERNAME", "unknown"),
     })
 
+    safety_rules = load_safety_rules()
+    system_prompt = (
+        "You are an expert Linux System Administrator AI. "
+        "You are running LOCALLY on the user's machine. "
+        "You have access to a 'run_shell_command' tool. "
+        "When asked to analyze or fix something, USE THE TOOL to inspect the system state first. "
+        "Do not hallucinate file contents. Run commands to read them."
+    )
+    if safety_rules:
+        system_prompt += "\n\n" + safety_rules
+
     messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are an expert Linux System Administrator AI. "
-                "You are running LOCALLY on the user's machine. "
-                "You have access to a 'run_shell_command' tool. "
-                "When asked to analyze or fix something, USE THE TOOL to inspect the system state first. "
-                "Do not hallucinate file contents. Run commands to read them."
-            )
-        },
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": "I am ready. " + get_system_context()}
     ]
 
@@ -236,14 +321,44 @@ def chat_loop():
                             "tool_call_id": tool_call.id,
                         })
 
-                        cmd_result, status = run_shell_command(cmd)
+                        # --- Safety check ---
+                        safety, reason = check_command_safety(cmd)
 
-                        log_event(logger, "tool_result", {
-                            "command": cmd,
-                            "output": cmd_result,
-                            "status": status,
-                            "tool_call_id": tool_call.id,
-                        })
+                        if safety == "blocked":
+                            cmd_result = f"BLOCKED: Command rejected by safety filter — {reason}. Do NOT attempt this command again."
+                            status = "blocked"
+                            print(f"\033[91m[BLOCKED]\033[0m {cmd}  ({reason})")
+                            log_event(logger, "command_blocked", {
+                                "command": cmd, "reason": reason,
+                                "tool_call_id": tool_call.id,
+                            })
+                        elif safety == "confirm":
+                            print(f"\033[93m[WARNING]\033[0m {cmd}")
+                            print(f"  Reason: {reason}")
+                            try:
+                                answer = input("  Allow this command? (y/N): ").strip().lower()
+                            except (KeyboardInterrupt, EOFError):
+                                answer = "n"
+                            if answer == "y":
+                                cmd_result, status = run_shell_command(cmd)
+                                log_event(logger, "tool_result", {
+                                    "command": cmd, "output": cmd_result,
+                                    "status": status, "tool_call_id": tool_call.id,
+                                })
+                            else:
+                                cmd_result = f"DENIED: User rejected this command — {reason}."
+                                status = "denied"
+                                print(f"\033[91m[DENIED]\033[0m Command rejected by user.")
+                                log_event(logger, "command_denied", {
+                                    "command": cmd, "reason": reason,
+                                    "tool_call_id": tool_call.id,
+                                })
+                        else:
+                            cmd_result, status = run_shell_command(cmd)
+                            log_event(logger, "tool_result", {
+                                "command": cmd, "output": cmd_result,
+                                "status": status, "tool_call_id": tool_call.id,
+                            })
                     else:
                         cmd_result = f"Error: Unknown tool '{tool_call.function.name}'"
                         status = "error"
