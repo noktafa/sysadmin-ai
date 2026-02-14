@@ -24,6 +24,15 @@ python3 sysadmin_ai.py [OPTIONS]
 - `SYSADMIN_AI_API_BASE` — API base URL override
 - `SYSADMIN_AI_MODEL` — Model name override
 
+## Command Safety Filter
+
+Every command the LLM requests goes through a two-tier safety check before execution:
+
+- **Blocklist** — 30+ regex patterns that unconditionally reject dangerous commands (destructive ops like `rm -rf /`, reverse shells, credential exfiltration, privilege escalation, kernel tampering). Blocked commands are never executed.
+- **Graylist** — commands that are risky but sometimes legitimate (`reboot`, `rm -r`, `apt remove`, `systemctl stop`, `iptables -F`, etc.) prompt the user for `y/N` confirmation before running.
+
+Safety rules from `soul.md` (if present in the script directory) are also loaded into the LLM's system prompt so the AI is aware of the constraints at runtime.
+
 ## Structured JSON Logging
 
 Every session automatically writes a structured log file in JSONL format (one JSON object per line) to `~/.sysadmin-ai/logs/session_<YYYYMMDD_HHMMSS>.jsonl`.
@@ -43,6 +52,8 @@ python3 sysadmin_ai.py --log-dir /tmp/ai-logs
 | `tool_call` | Command the LLM wants to run, plus its reasoning |
 | `tool_result` | Command output and exit status |
 | `llm_final_response` | The LLM's response after processing tool results |
+| `command_blocked` | Command rejected by the safety blocklist |
+| `command_denied` | Command rejected by the user (graylist prompt) |
 | `error` | API failures or other exceptions |
 
 ### Example log entry
@@ -61,6 +72,13 @@ python3 sysadmin_ai.py --log-dir /tmp/ai-logs
 ```
 
 ## Release Notes
+
+### v0.5.0
+
+- **Command safety filter** — two-tier blocklist/graylist system with 30+ regex patterns that intercepts dangerous commands before execution
+- **Graylist user confirmation** — risky-but-legitimate commands (`reboot`, `rm -r`, `apt remove`, etc.) prompt `y/N` before running
+- **soul.md loaded into system prompt** — safety rules are now visible to the LLM at runtime, not just a static document
+- **New log events** — `command_blocked` and `command_denied` for safety audit trail
 
 ### v0.4.0
 
