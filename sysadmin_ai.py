@@ -155,6 +155,15 @@ BLOCKED_PATTERNS = [
     (r"\b(modprobe|insmod|rmmod)\b", "Kernel module manipulation"),
     (r">\s*/(boot|sys|proc)/", "Writing to boot/sys/proc"),
     (r"\bgrub-install\b", "Bootloader modification"),
+    # --- Windows-specific ---
+    (r"\bformat\s+[A-Za-z]:", "Disk format operation"),
+    (r"\bdel\s+(/[a-zA-Z]+\s+)*[A-Za-z]:[\\\/](Windows|Program Files|Users)", "Recursive deletion of system directory"),
+    (r"\brd\s+(/[a-zA-Z]+\s+)*[A-Za-z]:[\\\/](Windows|Program Files|Users)", "Recursive deletion of system directory"),
+    (r"\breg\s+delete\s+HKLM", "Registry deletion of machine keys"),
+    (r"\bbcdedit\b", "Boot configuration modification"),
+    (r"\bdiskpart\b", "Disk partition manipulation"),
+    (r"Remove-Item\s+.*[\\\/](Windows|Program Files|Users).*-Recurse|Remove-Item\s+.*-Recurse.*[\\\/](Windows|Program Files|Users)", "Recursive deletion of system directory"),
+    (r"\bStop-Computer\b", "System shutdown via PowerShell"),
 ]
 
 # Commands that require user confirmation before execution
@@ -167,6 +176,12 @@ GRAYLIST_PATTERNS = [
     (r"\biptables\s+(-[a-zA-Z]*\s+)*-F", "Firewall rule flush"),
     (r"\bufw\s+disable\b", "Firewall disable"),
     (r"\bmv\s+/etc/", "Moving system config file"),
+    # --- Windows-specific ---
+    (r"\bRestart-Computer\b", "System restart via PowerShell"),
+    (r"\bRestart-Service\b", "Service restart via PowerShell"),
+    (r"\bStop-Service\b", "Service stop via PowerShell"),
+    (r"\bnet\s+stop\b", "Service stop via net"),
+    (r"\breg\s+delete\b", "Registry key deletion"),
 ]
 
 
@@ -209,18 +224,29 @@ def get_system_context():
     )
 
 # --- TOOLS ---
+_IS_WINDOWS = platform.system() == "Windows"
+
+_TOOL_EXAMPLES = (
+    "e.g., 'systeminfo', 'Get-Process', 'dir', 'tasklist'"
+    if _IS_WINDOWS
+    else "e.g., 'cat /var/log/syslog', 'grep error', 'ls -la', 'df -h'"
+)
+
 tools = [
     {
         "type": "function",
         "function": {
             "name": "run_shell_command",
-            "description": "Executes a shell command on the local machine and returns the output. Use this to inspect files, check processes, or fix issues.",
+            "description": (
+                "Executes a shell command on the local machine and returns the output. "
+                "Use this to inspect files, check processes, or fix issues."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "The shell command to execute (e.g., 'cat /var/log/syslog', 'grep error', 'ls -la')"
+                        "description": f"The shell command to execute ({_TOOL_EXAMPLES})"
                     }
                 },
                 "required": ["command"]
@@ -242,7 +268,10 @@ def run_shell_command(command, cwd=None):
     print(f"\033[93m[EXEC]\033[0m {command}")
     # Append a sentinel + pwd so we can capture the cwd after the command,
     # even if the command itself calls cd.
-    wrapped = f"{command}\n__exit=$?\necho {CWD_SENTINEL}\npwd\nexit $__exit"
+    if _IS_WINDOWS:
+        wrapped = f"{command}\r\necho {CWD_SENTINEL}\r\ncd"
+    else:
+        wrapped = f"{command}\n__exit=$?\necho {CWD_SENTINEL}\npwd\nexit $__exit"
     try:
         result = subprocess.run(
             wrapped, shell=True, text=True, capture_output=True, timeout=30,
@@ -286,10 +315,24 @@ def chat_loop():
     })
 
     safety_rules = load_safety_rules()
+    os_name = platform.system()
     system_prompt = (
-        "You are an expert Linux System Administrator AI. "
+        "You are an expert System Administrator AI. "
         "You are running LOCALLY on the user's machine. "
-        "You have access to a 'run_shell_command' tool. "
+        f"The operating system is {os_name}. "
+        "You have access to a 'run_shell_command' tool that executes shell commands. "
+    )
+    if os_name == "Windows":
+        system_prompt += (
+            "Use Windows commands (cmd.exe and PowerShell). "
+            "Examples: 'systeminfo', 'Get-Process', 'Get-Service', 'tasklist', 'wmic cpu get loadpercentage'. "
+        )
+    else:
+        system_prompt += (
+            "Use appropriate shell commands for the OS. "
+            "Examples: 'top -bn1', 'df -h', 'ps aux', 'cat /var/log/syslog'. "
+        )
+    system_prompt += (
         "When asked to analyze or fix something, USE THE TOOL to inspect the system state first. "
         "Do not hallucinate file contents. Run commands to read them."
     )
