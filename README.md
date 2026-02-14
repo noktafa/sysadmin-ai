@@ -17,6 +17,7 @@ python3 sysadmin_ai.py [OPTIONS]
 | `--api-key KEY` | Override API key |
 | `--model NAME` | Override model name |
 | `--log-dir DIR` | Override log directory (default: `~/.sysadmin-ai/logs/`) |
+| `--safe-mode` | Run commands inside a Docker container instead of directly on the host |
 
 ### Environment Variables
 
@@ -26,7 +27,7 @@ python3 sysadmin_ai.py [OPTIONS]
 
 ## Persistent Shell State
 
-By default, each command the AI runs executes in an isolated subprocess — meaning `cd`, `export`, and other stateful shell operations would be lost between turns. SysAdmin AI solves this with **Python-side CWD tracking** that gives the AI the feel of a persistent shell without the security risks of a live PTY.
+By default, each command the AI runs executes in an isolated subprocess — meaning `cd`, `export`, and other stateful shell operations would be lost between turns. SysAdmin AI solves this with **Python-side CWD tracking** (implemented in `HostExecutor`) that gives the AI the feel of a persistent shell without the security risks of a live PTY.
 
 ### How it works
 
@@ -75,6 +76,32 @@ AI:  [runs: du -sh *]     →  runs in /var/log, not $HOME
 ### Why not a persistent PTY?
 
 A persistent shell (via `pexpect` or PTY) accumulates hidden state, makes timeout handling fragile, and allows multi-step safety filter bypasses (e.g., setting an alias in turn 1, exploiting it in turn 2). The CWD-tracking approach covers the most common use case (`cd` persistence) with none of these risks.
+
+## Executor Abstraction (Strategy Pattern)
+
+Command execution is decoupled from the chat loop via an `Executor` ABC. This enables swapping execution backends without touching the LLM orchestration logic.
+
+| Executor | Backend | When used |
+|----------|---------|-----------|
+| `HostExecutor` | `subprocess.run(shell=True)` on the host | Default (no flags) |
+| `DockerExecutor` | `docker exec` inside a disposable container | `--safe-mode` |
+
+Both executors implement the same interface: `execute(command, cwd=None) → (output, status, new_cwd)` and `cleanup()`.
+
+### Safe Mode (Docker Sandbox)
+
+Pass `--safe-mode` to run all commands inside an isolated Docker container instead of directly on the host:
+
+```bash
+python3 sysadmin_ai.py --safe-mode
+```
+
+This starts a disposable `ubuntu:22.04` container named `sysadmin-ai-<SESSION_ID>` that is automatically removed when the session ends. Requires Docker to be installed and running.
+
+- Commands execute via `docker exec` — the host filesystem is never touched
+- CWD tracking works via appended `pwd` (Linux-only containers)
+- The safety filter still runs on the host side before any command reaches the container
+- If Docker is not installed or not running, a clear `RuntimeError` is raised at startup
 
 ## Command Safety Filter
 
@@ -131,7 +158,7 @@ python3 sysadmin_ai.py --log-dir /tmp/ai-logs
 
 | Event | Description |
 |-------|-------------|
-| `session_start` | Provider, model, base URL, OS, user |
+| `session_start` | Provider, model, base URL, OS, user, executor type, safe_mode flag |
 | `user_input` | The user's message |
 | `tool_call` | Command the LLM wants to run, plus its reasoning |
 | `tool_result` | Command output, exit status, and current working directory |
@@ -163,9 +190,17 @@ Run the full test suite:
 python -m pytest tests/ -v
 ```
 
-30 tests across 7 classes: safety filter, shell execution, PowerShell wrapping, Windows execution, CWD tracking, encoding, and message history trimming. One test (Unix `cd` tracking) is automatically skipped on Windows.
+54 tests across 8 classes: safety filter, shell execution, PowerShell wrapping, Windows execution, CWD tracking, encoding, message history trimming, and log redaction. One test (Unix `cd` tracking) is automatically skipped on Windows.
 
 ## Release Notes
+
+### v0.11.0
+
+- **Executor abstraction layer** — command execution is decoupled from the chat loop via an `Executor` ABC (Strategy Pattern). `HostExecutor` wraps the existing `subprocess.run` logic; `DockerExecutor` runs commands inside a disposable Docker container. The chat loop selects the executor based on CLI flags, with no changes to safety filtering or LLM orchestration.
+- **`--safe-mode` CLI flag** — pass `--safe-mode` to run all commands inside an isolated `ubuntu:22.04` Docker container instead of directly on the host. The container is automatically created at startup and removed on exit. Prints a `[SAFE MODE]` banner when active.
+- **`DockerExecutor` skeleton** — uses Docker CLI (`docker run -d`, `docker exec`, `docker rm -f`) with no new Python dependencies. CWD tracking via appended `pwd`. Raises `RuntimeError` with a clear message if Docker is not installed or not running.
+- **Backward-compatible wrappers** — module-level `run_shell_command()`, `_needs_powershell_wrap()`, and `CWD_SENTINEL` delegate to `HostExecutor`, preserving all existing test imports. Zero test changes required.
+- **Extended session logging** — `session_start` event now includes `executor` (class name) and `safe_mode` (boolean) fields.
 
 ### v0.10.1
 
