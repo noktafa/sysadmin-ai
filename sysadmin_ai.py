@@ -12,6 +12,7 @@ from openai import OpenAI
 
 # --- SETTINGS ---
 MAX_OUTPUT_CHARS = 8000  # Truncate long command output to protect context window
+MAX_HISTORY_MESSAGES = 80  # Trim older messages to stay within context limits
 DEFAULT_LOG_DIR = os.path.join(Path.home(), ".sysadmin-ai", "logs")
 
 # Provider presets: (base_url, default_model, env_key_var)
@@ -347,6 +348,33 @@ def run_shell_command(command, cwd=None):
     except Exception as e:
         return f"Error executing command: {str(e)}", "error", None
 
+def trim_message_history(messages):
+    """Trim old messages to stay within context limits.
+
+    Keeps:
+      - messages[0]: system prompt (always)
+      - The most recent MAX_HISTORY_MESSAGES messages
+
+    When messages are trimmed a short notice is injected so the LLM
+    knows prior context was dropped.
+    """
+    if len(messages) <= MAX_HISTORY_MESSAGES + 1:  # +1 for system prompt
+        return messages
+
+    system = messages[0]
+    recent = messages[-(MAX_HISTORY_MESSAGES):]
+
+    trimmed_count = len(messages) - 1 - MAX_HISTORY_MESSAGES
+    notice = {
+        "role": "user",
+        "content": (
+            f"[Note: {trimmed_count} older messages were trimmed to stay "
+            "within context limits. Recent conversation follows.]"
+        ),
+    }
+    return [system, notice] + recent
+
+
 # --- CHAT LOOP ---
 def chat_loop():
     args = parse_args()
@@ -415,6 +443,9 @@ def chat_loop():
         messages.append({"role": "user", "content": f"(CWD: {shell_state['cwd']}) {user_input}"})
 
         try:
+            # Trim history before each API call to stay within context limits
+            messages = trim_message_history(messages)
+
             # Request completion with tool support
             response = client.chat.completions.create(
                 model=model_name,
@@ -494,6 +525,9 @@ def chat_loop():
                         "tool_call_id": tool_call.id,
                         "content": cmd_result
                     })
+
+                # Trim history before each API call to stay within context limits
+                messages = trim_message_history(messages)
 
                 # Let the LLM process all tool results and decide next action
                 response = client.chat.completions.create(
