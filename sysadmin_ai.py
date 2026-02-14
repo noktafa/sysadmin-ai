@@ -8,6 +8,7 @@ from openai import OpenAI
 
 # --- SETTINGS ---
 MAX_OUTPUT_CHARS = 8000  # Truncate long command output to protect context window
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Provider presets: (base_url, default_model, env_key_var)
 PROVIDERS = {
@@ -55,6 +56,18 @@ def parse_args():
     parser.add_argument("--api-key", help="Override API key")
     parser.add_argument("--model", help="Override model name")
     return parser.parse_args()
+
+
+def load_soul():
+    """Load safety rules from soul.md."""
+    soul_path = os.path.join(SCRIPT_DIR, "soul.md")
+    try:
+        with open(soul_path, "r") as f:
+            return f.read()
+    except FileNotFoundError:
+        print(f"\033[91m[ERROR]\033[0m soul.md not found at {soul_path}")
+        sys.exit(1)
+
 
 # --- SYSTEM CONTEXT ---
 def get_system_context():
@@ -110,6 +123,7 @@ def run_shell_command(command):
 def chat_loop():
     args = parse_args()
     client, model_name, base_url = build_client(args)
+    soul = load_soul()
 
     messages = [
         {
@@ -119,7 +133,8 @@ def chat_loop():
                 "You are running LOCALLY on the user's machine. "
                 "You have access to a 'run_shell_command' tool. "
                 "When asked to analyze or fix something, USE THE TOOL to inspect the system state first. "
-                "Do not hallucinate file contents. Run commands to read them."
+                "Do not hallucinate file contents. Run commands to read them.\n\n"
+                + soul
             )
         },
         {"role": "user", "content": "I am ready. " + get_system_context()}
