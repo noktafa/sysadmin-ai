@@ -60,6 +60,28 @@ python3 sysadmin_ai.py --log-dir /tmp/ai-logs
 }
 ```
 
+## Release Notes
+
+### v0.4.0
+
+- **Structured JSON logging** — every session now writes a JSONL audit log to `~/.sysadmin-ai/logs/`, capturing commands executed, LLM reasoning, tool output, and errors
+- **`--log-dir` CLI flag** — override the default log directory
+- **Exit status tracking** — `run_shell_command` now returns exit status (`success`, `exit_N`, `timeout`, `error`) alongside output
+
+### v0.3.0
+
+- **Safety rules** — added `soul.md` guardrails to prevent harmful commands
+
+### v0.2.0
+
+- **Cross-platform compatibility** — fixes for Windows, Linux, and macOS
+
+### v0.1.0
+
+- **Initial release** — LLM-powered sysadmin assistant with OpenAI and vLLM provider support, interactive shell command execution, and multi-step tool-call reasoning
+
+---
+
 ### Parsing logs
 
 Since logs are JSONL, you can use standard tools:
