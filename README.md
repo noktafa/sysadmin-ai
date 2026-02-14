@@ -60,10 +60,31 @@ A persistent shell (via `pexpect` or PTY) accumulates hidden state, makes timeou
 
 Every command the LLM requests goes through a two-tier safety check before execution:
 
-- **Blocklist** — 30+ regex patterns that unconditionally reject dangerous commands (destructive ops like `rm -rf /`, reverse shells, credential exfiltration, privilege escalation, kernel tampering). Blocked commands are never executed.
-- **Graylist** — commands that are risky but sometimes legitimate (`reboot`, `rm -r`, `apt remove`, `systemctl stop`, `iptables -F`, etc.) prompt the user for `y/N` confirmation before running.
+- **Blocklist** — 40+ regex patterns that unconditionally reject dangerous commands. Blocked commands are never executed.
+- **Graylist** — commands that are risky but sometimes legitimate prompt the user for `y/N` confirmation before running.
 
-Safety rules from `soul.md` (if present in the script directory) are also loaded into the LLM's system prompt so the AI is aware of the constraints at runtime.
+Both tiers include OS-specific patterns:
+
+| Category | Linux / macOS | Windows |
+|----------|--------------|---------|
+| Destructive ops | `rm -rf /`, `mkfs`, `dd`, `shred` | `format C:`, `del /s`, `rd /s`, `diskpart`, `Remove-Item -Recurse` |
+| System sabotage | `chmod 000`, `kill -9 1`, `shutdown` | `Stop-Computer`, `bcdedit`, `reg delete HKLM` |
+| Credential access | `cat /etc/shadow`, SSH keys | SAM/NTDS dump, `mimikatz`, Wi-Fi passwords |
+| Privilege escalation | `sudo su`, SUID/SGID | Admin account creation, UAC bypass |
+| Network attacks | `curl \| bash`, reverse shells | `Invoke-WebRequest \| Invoke-Expression` |
+| Firewall | `iptables -F`, `ufw disable` | `netsh advfirewall ... off`, Defender disable |
+| Kernel/boot | `modprobe`, `grub-install` | `bcdedit` |
+| macOS-specific | `csrutil disable`, `nvram` | — |
+
+### soul.md
+
+Safety rules from `soul.md` (if present in the script directory) are loaded into the LLM's system prompt so the AI is aware of the constraints at runtime. The file is organized into sections:
+
+- **All Platforms** — network attacks, credential exfiltration
+- **Linux / macOS** — destructive ops, system sabotage, firewall, privilege escalation, kernel/boot
+- **macOS-Specific** — SIP, nvram, `/System` protections
+- **Windows** — format, diskpart, registry, SAM, Defender, UAC, firewall
+- **Required Behavior** — OS-appropriate safe practices (`--dry-run` on Unix, `-WhatIf` on PowerShell)
 
 ## Structured JSON Logging
 
@@ -105,14 +126,24 @@ python3 sysadmin_ai.py --log-dir /tmp/ai-logs
 
 ## Release Notes
 
-### v0.6.0
+### v0.8.0
+
+- **OS-aware system prompt** — the LLM is now told which OS it's running on and given platform-appropriate command examples (PowerShell/cmd on Windows, shell on Unix)
+- **OS-aware tool description** — tool examples adapt to the OS (`systeminfo`, `Get-Process` on Windows vs `df -h`, `ps aux` on Unix)
+- **Windows CWD sentinel** — uses `cd` (cmd.exe built-in) instead of `pwd` on Windows for directory tracking
+- **Windows safety patterns** — blocklist adds `format`, `del /s`, `rd /s`, `bcdedit`, `diskpart`, `Stop-Computer`, `Remove-Item -Recurse`, `reg delete HKLM`; graylist adds `Restart-Computer`, `Stop-Service`, `Restart-Service`, `net stop`, `reg delete`
+- **Restructured soul.md** — safety rules organized into cross-platform, Linux/macOS, macOS-specific, and Windows sections with OS-appropriate guidance (e.g., `-WhatIf` for PowerShell, `--dry-run` for Unix)
+- **macOS rules in soul.md** — `csrutil disable`, `nvram` tampering, `/System` and `/Library` protections
+- **Windows rules in soul.md** — SAM/NTDS credential dumping, UAC bypass, Defender disable, firewall disable, admin account creation
+
+### v0.7.0
 
 - **Persistent working directory** — the AI's shell now remembers `cd` across commands via Python-side CWD tracking. Each command runs with `subprocess.run(cwd=tracked_cwd)` and a post-command `pwd` sentinel captures directory changes.
 - **`shell_state` tracking** — session maintains a state dict starting at `$HOME`. The tracked `cwd` is passed in every user message and logged in `tool_result` events.
 - **Sentinel-based pwd capture** — a hidden `__SYSADMIN_AI_PWD__` marker is appended after each command to detect directory changes. The sentinel and its output are stripped from all visible output.
 - **`run_shell_command` returns 3-tuple** — now returns `(output, status, new_cwd)` instead of `(output, status)`. `new_cwd` is `None` on timeout/error, preserving the last known directory.
 
-### v0.5.0
+### v0.6.0
 
 - **Command safety filter** — two-tier blocklist/graylist system with 30+ regex patterns that intercepts dangerous commands before execution
 - **Graylist user confirmation** — risky-but-legitimate commands (`reboot`, `rm -r`, `apt remove`, etc.) prompt `y/N` before running
