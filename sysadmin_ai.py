@@ -1,5 +1,6 @@
 import os
 import sys
+import platform
 import argparse
 import subprocess
 import json
@@ -60,8 +61,8 @@ def get_system_context():
     """Gathers current system info to feed the LLM."""
     return (
         "SYSTEM CONTEXT:\n"
-        f"- OS: {subprocess.getoutput('uname -sr')}\n"
-        f"- User: {os.environ.get('USER', 'unknown')}\n"
+        f"- OS: {platform.system()} {platform.release()}\n"
+        f"- User: {os.environ.get('USER') or os.environ.get('USERNAME', 'unknown')}\n"
         f"- Current Dir: {os.getcwd()}\n"
         f"- Files in Dir: {str(os.listdir('.'))[:500]} ... (truncated)"
     )
