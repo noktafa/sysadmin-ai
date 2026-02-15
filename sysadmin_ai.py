@@ -577,6 +577,9 @@ def run_shell_command(command, cwd=None):
 def _check_read_safety(full_path):
     """Check if a file path is safe to read.
 
+    IMPORTANT: Callers must resolve symlinks (os.path.realpath) BEFORE calling
+    this function.  This function is a pure string matcher — no filesystem access.
+
     Returns:
         ("blocked", reason) - read must not proceed
         ("safe", None)      - read can proceed
@@ -600,6 +603,9 @@ def _check_read_safety(full_path):
 
 def _check_write_safety(full_path):
     """Check if a file path is safe to write to.
+
+    IMPORTANT: Callers must resolve symlinks (os.path.realpath) BEFORE calling
+    this function.  This function is a pure string matcher — no filesystem access.
 
     Returns:
         ("blocked", reason) - write must not proceed
@@ -647,7 +653,7 @@ def _check_write_safety(full_path):
 def read_file_content(path, cwd):
     """Read a file using Python I/O.  Returns (content_or_error, status)."""
     try:
-        full_path = os.path.abspath(os.path.join(cwd, os.path.expanduser(path)))
+        full_path = os.path.realpath(os.path.join(cwd, os.path.expanduser(path)))
 
         if not os.path.exists(full_path):
             return f"Error: File not found: {full_path}", "error"
@@ -675,7 +681,7 @@ def read_file_content(path, cwd):
 def write_file_content(path, content, cwd):
     """Write content to a file using Python I/O.  Returns (message_or_error, status)."""
     try:
-        full_path = os.path.abspath(os.path.join(cwd, os.path.expanduser(path)))
+        full_path = os.path.realpath(os.path.join(cwd, os.path.expanduser(path)))
 
         parent = os.path.dirname(full_path)
         if parent and not os.path.exists(parent):
@@ -741,13 +747,24 @@ def chat_loop():
 
     safety_rules = load_safety_rules()
     os_name = platform.system()
+    # In safe mode, commands run inside a Linux container regardless of host OS
+    effective_os = "Linux" if args.safe_mode else os_name
     system_prompt = (
         "You are an expert System Administrator AI. "
-        "You are running LOCALLY on the user's machine. "
-        f"The operating system is {os_name}. "
-        "You have access to a 'run_shell_command' tool that executes shell commands. "
     )
-    if os_name == "Windows":
+    if args.safe_mode:
+        system_prompt += (
+            "You are running commands inside an Ubuntu Linux Docker container on the user's machine. "
+            f"The HOST operating system is {os_name}, but your commands execute in Linux. "
+            "You have access to a 'run_shell_command' tool that executes shell commands. "
+        )
+    else:
+        system_prompt += (
+            "You are running LOCALLY on the user's machine. "
+            f"The operating system is {os_name}. "
+            "You have access to a 'run_shell_command' tool that executes shell commands. "
+        )
+    if effective_os == "Windows":
         system_prompt += (
             "Use Windows commands (cmd.exe and PowerShell). "
             "IMPORTANT: For PowerShell cmdlets, always prefix with 'powershell -command', "
@@ -777,197 +794,33 @@ def chat_loop():
     ]
 
     # Shell state tracking — cwd persists across commands
-    shell_state = {"cwd": str(Path.home())}
+    # In safe mode, start in the container's home dir, not the host's
+    shell_state = {"cwd": "/root" if args.safe_mode else str(Path.home())}
 
     print(f"\033[92m[SysAdmin AI Connected]\033[0m provider=\033[96m{args.provider}\033[0m model=\033[96m{model_name}\033[0m")
     print(f"\033[90m  endpoint: {base_url}\033[0m")
     if args.safe_mode:
         print("\033[93m[SAFE MODE]\033[0m Commands run inside Docker container")
 
-    while True:
-        try:
-            user_input = input("\033[94mYou:\033[0m ")
-        except (KeyboardInterrupt, EOFError):
-            print("\nExiting...")
-            break
+    try:
+        while True:
+            try:
+                user_input = input("\033[94mYou:\033[0m ")
+            except (KeyboardInterrupt, EOFError):
+                print("\nExiting...")
+                break
 
-        if user_input.lower() in ['exit', 'quit']:
-            break
+            if user_input.lower() in ['exit', 'quit']:
+                break
 
-        log_event(logger, "user_input", {"message": user_input})
-        messages.append({"role": "user", "content": f"(CWD: {shell_state['cwd']}) {user_input}"})
+            log_event(logger, "user_input", {"message": user_input})
+            messages.append({"role": "user", "content": f"(CWD: {shell_state['cwd']}) {user_input}"})
 
-        try:
-            # Trim history before each API call to stay within context limits
-            messages = trim_message_history(messages)
-
-            # Request completion with tool support
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=messages,
-                tools=tools,
-                tool_choice="auto"
-            )
-            msg = response.choices[0].message
-            messages.append(msg)
-
-            # Process tool calls in a loop to support multi-step reasoning
-            while msg.tool_calls:
-                # Extract reasoning text that may precede tool calls
-                reasoning = msg.content or ""
-
-                for tool_call in msg.tool_calls:
-                    if tool_call.function.name == "run_shell_command":
-                        tool_args = json.loads(tool_call.function.arguments)
-                        cmd = tool_args.get("command", "")
-
-                        log_event(logger, "tool_call", {
-                            "command": cmd,
-                            "reasoning": reasoning,
-                            "tool_call_id": tool_call.id,
-                        })
-
-                        # --- Safety check ---
-                        safety, reason = check_command_safety(cmd)
-
-                        if safety == "blocked":
-                            cmd_result = f"BLOCKED: Command rejected by safety filter — {reason}. Do NOT attempt this command again."
-                            status = "blocked"
-                            print(f"\033[91m[BLOCKED]\033[0m {cmd}  ({reason})")
-                            log_event(logger, "command_blocked", {
-                                "command": cmd, "reason": reason,
-                                "tool_call_id": tool_call.id,
-                            })
-                        elif safety == "confirm":
-                            print(f"\033[93m[WARNING]\033[0m {cmd}")
-                            print(f"  Reason: {reason}")
-                            try:
-                                answer = input("  Allow this command? (y/N): ").strip().lower()
-                            except (KeyboardInterrupt, EOFError):
-                                answer = "n"
-                            if answer == "y":
-                                cmd_result, status, new_cwd = executor.execute(cmd, cwd=shell_state["cwd"])
-                                if new_cwd:
-                                    shell_state["cwd"] = new_cwd
-                                log_event(logger, "tool_result", {
-                                    "command": cmd, "output": cmd_result,
-                                    "status": status, "cwd": shell_state["cwd"],
-                                    "tool_call_id": tool_call.id,
-                                })
-                            else:
-                                cmd_result = f"DENIED: User rejected this command — {reason}."
-                                status = "denied"
-                                print(f"\033[91m[DENIED]\033[0m Command rejected by user.")
-                                log_event(logger, "command_denied", {
-                                    "command": cmd, "reason": reason,
-                                    "tool_call_id": tool_call.id,
-                                })
-                        else:
-                            cmd_result, status, new_cwd = executor.execute(cmd, cwd=shell_state["cwd"])
-                            if new_cwd:
-                                shell_state["cwd"] = new_cwd
-                            log_event(logger, "tool_result", {
-                                "command": cmd, "output": cmd_result,
-                                "status": status, "cwd": shell_state["cwd"],
-                                "tool_call_id": tool_call.id,
-                            })
-                    elif tool_call.function.name == "read_file":
-                        tool_args = json.loads(tool_call.function.arguments)
-                        file_path = tool_args.get("path", "")
-                        full_path = os.path.abspath(
-                            os.path.join(shell_state["cwd"], os.path.expanduser(file_path))
-                        )
-
-                        log_event(logger, "tool_call", {
-                            "tool": "read_file", "path": file_path,
-                            "reasoning": reasoning,
-                            "tool_call_id": tool_call.id,
-                        })
-
-                        safety, reason = _check_read_safety(full_path)
-                        if safety == "blocked":
-                            cmd_result = f"BLOCKED: Read rejected by safety filter — {reason}."
-                            print(f"\033[91m[BLOCKED]\033[0m read_file {file_path}  ({reason})")
-                            log_event(logger, "read_blocked", {
-                                "path": file_path, "reason": reason,
-                                "tool_call_id": tool_call.id,
-                            })
-                        else:
-                            print(f"\033[93m[READ]\033[0m {full_path}")
-                            cmd_result, status = read_file_content(file_path, shell_state["cwd"])
-                            log_event(logger, "tool_result", {
-                                "tool": "read_file", "path": file_path,
-                                "output": cmd_result, "status": status,
-                                "tool_call_id": tool_call.id,
-                            })
-
-                    elif tool_call.function.name == "write_file":
-                        tool_args = json.loads(tool_call.function.arguments)
-                        file_path = tool_args.get("path", "")
-                        file_content = tool_args.get("content", "")
-                        full_path = os.path.abspath(
-                            os.path.join(shell_state["cwd"], os.path.expanduser(file_path))
-                        )
-
-                        log_event(logger, "tool_call", {
-                            "tool": "write_file", "path": file_path,
-                            "content_length": len(file_content),
-                            "reasoning": reasoning,
-                            "tool_call_id": tool_call.id,
-                        })
-
-                        safety, reason = _check_write_safety(full_path)
-                        if safety == "blocked":
-                            cmd_result = f"BLOCKED: Write rejected by safety filter — {reason}. Do NOT attempt this write again."
-                            print(f"\033[91m[BLOCKED]\033[0m write_file {file_path}  ({reason})")
-                            log_event(logger, "write_blocked", {
-                                "path": file_path, "reason": reason,
-                                "tool_call_id": tool_call.id,
-                            })
-                        elif safety == "confirm":
-                            print(f"\033[93m[WARNING]\033[0m write_file {file_path}")
-                            print(f"  Reason: {reason}")
-                            try:
-                                answer = input("  Allow this write? (y/N): ").strip().lower()
-                            except (KeyboardInterrupt, EOFError):
-                                answer = "n"
-                            if answer == "y":
-                                print(f"\033[93m[WRITE]\033[0m {full_path} ({len(file_content)} chars)")
-                                cmd_result, status = write_file_content(file_path, file_content, shell_state["cwd"])
-                                log_event(logger, "tool_result", {
-                                    "tool": "write_file", "path": file_path,
-                                    "output": cmd_result, "status": status,
-                                    "tool_call_id": tool_call.id,
-                                })
-                            else:
-                                cmd_result = f"DENIED: User rejected this write — {reason}."
-                                print(f"\033[91m[DENIED]\033[0m Write rejected by user.")
-                                log_event(logger, "write_denied", {
-                                    "path": file_path, "reason": reason,
-                                    "tool_call_id": tool_call.id,
-                                })
-                        else:
-                            print(f"\033[93m[WRITE]\033[0m {full_path} ({len(file_content)} chars)")
-                            cmd_result, status = write_file_content(file_path, file_content, shell_state["cwd"])
-                            log_event(logger, "tool_result", {
-                                "tool": "write_file", "path": file_path,
-                                "output": cmd_result, "status": status,
-                                "tool_call_id": tool_call.id,
-                            })
-
-                    else:
-                        cmd_result = f"Error: Unknown tool '{tool_call.function.name}'"
-
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": cmd_result
-                    })
-
+            try:
                 # Trim history before each API call to stay within context limits
                 messages = trim_message_history(messages)
 
-                # Let the LLM process all tool results and decide next action
+                # Request completion with tool support
                 response = client.chat.completions.create(
                     model=model_name,
                     messages=messages,
@@ -977,18 +830,185 @@ def chat_loop():
                 msg = response.choices[0].message
                 messages.append(msg)
 
-            # Print the final text response
-            if msg.content:
-                print(f"\033[92mAI:\033[0m {msg.content}")
-                log_event(logger, "llm_final_response", {"content": msg.content})
-            else:
-                log_event(logger, "llm_response", {"content": None})
+                # Process tool calls in a loop to support multi-step reasoning
+                while msg.tool_calls:
+                    # Extract reasoning text that may precede tool calls
+                    reasoning = msg.content or ""
 
-        except Exception as e:
-            print(f"\033[91m[ERROR]\033[0m API call failed: {e}")
-            log_event(logger, "error", {"error": str(e), "type": type(e).__name__})
+                    for tool_call in msg.tool_calls:
+                        if tool_call.function.name == "run_shell_command":
+                            tool_args = json.loads(tool_call.function.arguments)
+                            cmd = tool_args.get("command", "")
 
-    executor.cleanup()
+                            log_event(logger, "tool_call", {
+                                "command": cmd,
+                                "reasoning": reasoning,
+                                "tool_call_id": tool_call.id,
+                            })
+
+                            # --- Safety check ---
+                            safety, reason = check_command_safety(cmd)
+
+                            if safety == "blocked":
+                                cmd_result = f"BLOCKED: Command rejected by safety filter — {reason}. Do NOT attempt this command again."
+                                status = "blocked"
+                                print(f"\033[91m[BLOCKED]\033[0m {cmd}  ({reason})")
+                                log_event(logger, "command_blocked", {
+                                    "command": cmd, "reason": reason,
+                                    "tool_call_id": tool_call.id,
+                                })
+                            elif safety == "confirm":
+                                print(f"\033[93m[WARNING]\033[0m {cmd}")
+                                print(f"  Reason: {reason}")
+                                try:
+                                    answer = input("  Allow this command? (y/N): ").strip().lower()
+                                except (KeyboardInterrupt, EOFError):
+                                    answer = "n"
+                                if answer == "y":
+                                    cmd_result, status, new_cwd = executor.execute(cmd, cwd=shell_state["cwd"])
+                                    if new_cwd:
+                                        shell_state["cwd"] = new_cwd
+                                    log_event(logger, "tool_result", {
+                                        "command": cmd, "output": cmd_result,
+                                        "status": status, "cwd": shell_state["cwd"],
+                                        "tool_call_id": tool_call.id,
+                                    })
+                                else:
+                                    cmd_result = f"DENIED: User rejected this command — {reason}."
+                                    status = "denied"
+                                    print(f"\033[91m[DENIED]\033[0m Command rejected by user.")
+                                    log_event(logger, "command_denied", {
+                                        "command": cmd, "reason": reason,
+                                        "tool_call_id": tool_call.id,
+                                    })
+                            else:
+                                cmd_result, status, new_cwd = executor.execute(cmd, cwd=shell_state["cwd"])
+                                if new_cwd:
+                                    shell_state["cwd"] = new_cwd
+                                log_event(logger, "tool_result", {
+                                    "command": cmd, "output": cmd_result,
+                                    "status": status, "cwd": shell_state["cwd"],
+                                    "tool_call_id": tool_call.id,
+                                })
+                        elif tool_call.function.name == "read_file":
+                            tool_args = json.loads(tool_call.function.arguments)
+                            file_path = tool_args.get("path", "")
+                            full_path = os.path.realpath(
+                                os.path.join(shell_state["cwd"], os.path.expanduser(file_path))
+                            )
+
+                            log_event(logger, "tool_call", {
+                                "tool": "read_file", "path": file_path,
+                                "reasoning": reasoning,
+                                "tool_call_id": tool_call.id,
+                            })
+
+                            safety, reason = _check_read_safety(full_path)
+                            if safety == "blocked":
+                                cmd_result = f"BLOCKED: Read rejected by safety filter — {reason}."
+                                print(f"\033[91m[BLOCKED]\033[0m read_file {file_path}  ({reason})")
+                                log_event(logger, "read_blocked", {
+                                    "path": file_path, "reason": reason,
+                                    "tool_call_id": tool_call.id,
+                                })
+                            else:
+                                print(f"\033[93m[READ]\033[0m {full_path}")
+                                cmd_result, status = read_file_content(file_path, shell_state["cwd"])
+                                log_event(logger, "tool_result", {
+                                    "tool": "read_file", "path": file_path,
+                                    "output": cmd_result, "status": status,
+                                    "tool_call_id": tool_call.id,
+                                })
+
+                        elif tool_call.function.name == "write_file":
+                            tool_args = json.loads(tool_call.function.arguments)
+                            file_path = tool_args.get("path", "")
+                            file_content = tool_args.get("content", "")
+                            full_path = os.path.realpath(
+                                os.path.join(shell_state["cwd"], os.path.expanduser(file_path))
+                            )
+
+                            log_event(logger, "tool_call", {
+                                "tool": "write_file", "path": file_path,
+                                "content_length": len(file_content),
+                                "reasoning": reasoning,
+                                "tool_call_id": tool_call.id,
+                            })
+
+                            safety, reason = _check_write_safety(full_path)
+                            if safety == "blocked":
+                                cmd_result = f"BLOCKED: Write rejected by safety filter — {reason}. Do NOT attempt this write again."
+                                print(f"\033[91m[BLOCKED]\033[0m write_file {file_path}  ({reason})")
+                                log_event(logger, "write_blocked", {
+                                    "path": file_path, "reason": reason,
+                                    "tool_call_id": tool_call.id,
+                                })
+                            elif safety == "confirm":
+                                print(f"\033[93m[WARNING]\033[0m write_file {file_path}")
+                                print(f"  Reason: {reason}")
+                                try:
+                                    answer = input("  Allow this write? (y/N): ").strip().lower()
+                                except (KeyboardInterrupt, EOFError):
+                                    answer = "n"
+                                if answer == "y":
+                                    print(f"\033[93m[WRITE]\033[0m {full_path} ({len(file_content)} chars)")
+                                    cmd_result, status = write_file_content(file_path, file_content, shell_state["cwd"])
+                                    log_event(logger, "tool_result", {
+                                        "tool": "write_file", "path": file_path,
+                                        "output": cmd_result, "status": status,
+                                        "tool_call_id": tool_call.id,
+                                    })
+                                else:
+                                    cmd_result = f"DENIED: User rejected this write — {reason}."
+                                    print(f"\033[91m[DENIED]\033[0m Write rejected by user.")
+                                    log_event(logger, "write_denied", {
+                                        "path": file_path, "reason": reason,
+                                        "tool_call_id": tool_call.id,
+                                    })
+                            else:
+                                print(f"\033[93m[WRITE]\033[0m {full_path} ({len(file_content)} chars)")
+                                cmd_result, status = write_file_content(file_path, file_content, shell_state["cwd"])
+                                log_event(logger, "tool_result", {
+                                    "tool": "write_file", "path": file_path,
+                                    "output": cmd_result, "status": status,
+                                    "tool_call_id": tool_call.id,
+                                })
+
+                        else:
+                            cmd_result = f"Error: Unknown tool '{tool_call.function.name}'"
+
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": cmd_result
+                        })
+
+                    # Trim history before each API call to stay within context limits
+                    messages = trim_message_history(messages)
+
+                    # Let the LLM process all tool results and decide next action
+                    response = client.chat.completions.create(
+                        model=model_name,
+                        messages=messages,
+                        tools=tools,
+                        tool_choice="auto"
+                    )
+                    msg = response.choices[0].message
+                    messages.append(msg)
+
+                # Print the final text response
+                if msg.content:
+                    print(f"\033[92mAI:\033[0m {msg.content}")
+                    log_event(logger, "llm_final_response", {"content": msg.content})
+                else:
+                    log_event(logger, "llm_response", {"content": None})
+
+            except Exception as e:
+                print(f"\033[91m[ERROR]\033[0m API call failed: {e}")
+                log_event(logger, "error", {"error": str(e), "type": type(e).__name__})
+
+    finally:
+        executor.cleanup()
 
 if __name__ == "__main__":
     chat_loop()
