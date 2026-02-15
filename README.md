@@ -142,6 +142,7 @@ Safety rules from `soul.md` (if present in the script directory) are loaded into
 - **macOS-Specific** — SIP, nvram, `/System` protections
 - **Windows** — format, diskpart, registry, SAM, Defender, UAC, firewall
 - **File I/O Tools** — prefer `read_file`/`write_file` over shell, blocked write paths, read-before-write
+- **Domain-Specific Behavioral Guardrails** — 10 sections covering safe approaches to service management, database operations, network configuration, package management, log & disk management, backup & recovery, SSL/TLS certificates, containers & orchestration, cron & scheduled tasks, and user & permission management
 - **Required Behavior** — OS-appropriate safe practices (`--dry-run` on Unix, `-WhatIf` on PowerShell)
 
 ## Native File I/O Tools
@@ -243,6 +244,10 @@ python -m pytest tests/ -v
 110 tests across 16 classes covering safety filters, shell execution, PowerShell wrapping, Windows execution, CWD tracking, encoding, message history trimming, log redaction, executor abstraction, file I/O, path traversal, symlink safety, and platform constants. Windows-only and macOS-only tests are automatically skipped on other platforms.
 
 ## Release Notes
+
+### v0.14.0
+
+- **Domain-specific behavioral guardrails** — 10 new sections in `soul.md` encoding safe approaches to common sysadmin tasks. These go beyond command blocklists to define *how* the AI should approach service management, database operations, network changes, package management, log/disk cleanup, backups, SSL/TLS certificates, containers, cron jobs, and user/permission management. Examples: check dependent services before stopping one, ask about backups before destructive operations, validate config syntax before restarting services, warn about session disconnection before network changes.
 
 ### v0.13.0
 
