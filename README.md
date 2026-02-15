@@ -1,14 +1,12 @@
 # SysAdmin AI
 
-> SysAdmin AI, sunucu yönetimini güvenli ve öngörülebilir kılmak amacıyla tasarlanmış, her komutu bağımsız ve temiz bir başlangıçla yürüten bir terminal asistanıdır. Oturum hatalarını önlemek için işlemleri sırayla, kullanıcının gözetiminde gerçekleştirir.
+> SysAdmin AI, sunucu yönetimini güvenli ve öngörülebilir kılmak amacıyla tasarlanmış, komutları bağımsız başlangıçlarla yürüten bir terminal asistanıdır.
+> Oturum hatalarını önlemek için işlemleri sırayla, kullanıcının gözetiminde gerçekleştirir ve "durumsuz" (stateless) bir yapı benimser; her komut, izole bir süreçte çalıştırılır.
 >
-> Tasarım felsefesi "durumsuz" (stateless) bir yapı benimser; yani her komut, önceki işlemlerin bıraktığı potansiyel hatalı değişkenlerden veya takma adlardan (alias) arındırılmış, izole bir süreçte çalıştırılır.
->
-> Bu tasarımın gereği olarak sunucunun bütünlüğünü korumayı otonom yeteneklere tercih eder.
+> Tasarım felsefesi gereği olarak sunucunun bütünlüğünü korumayı otonom yeteneklere tercih eder.
 
-> SysAdmin AI is a terminal assistant designed to make server administration safe and predictable, executing each command independently with a clean start. To prevent session errors, it performs operations sequentially under user supervision.
->
-> Its design philosophy adopts a stateless architecture — each command runs in an isolated process, free from potentially faulty variables or aliases left behind by previous operations.
+> SysAdmin AI is a terminal assistant designed to make server administration safe and predictable, executing commands with independent starts.
+> To prevent session errors, it performs operations sequentially under user supervision and adopts a stateless architecture — each command runs in an isolated process.
 >
 > By design, it prioritizes preserving server integrity over autonomous capabilities.
 
