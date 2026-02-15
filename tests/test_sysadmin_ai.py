@@ -1071,7 +1071,7 @@ class TestHostExecutorUnixPath(unittest.TestCase):
 
     @patch("sysadmin_ai._IS_WINDOWS", False)
     def test_unix_sentinel_format(self):
-        """On Unix, the sentinel should use () wrapping and pwd."""
+        """On Unix, the sentinel should NOT use subshell wrapping (cd must persist)."""
         executor = HostExecutor()
         with patch("subprocess.run") as mock_run:
             mock_result = MagicMock()
@@ -1081,10 +1081,11 @@ class TestHostExecutorUnixPath(unittest.TestCase):
 
             output, status, cwd = executor.execute("echo hello", cwd="/home/testuser")
 
-            # Verify the command was wrapped with Unix sentinel format
+            # Verify the command was wrapped without subshell
             call_args = mock_run.call_args
             wrapped_cmd = call_args[0][0]
-            self.assertIn("(echo hello)", wrapped_cmd)
+            self.assertIn("echo hello", wrapped_cmd)
+            self.assertNotIn("(echo hello)", wrapped_cmd)  # No subshell
             self.assertIn("pwd", wrapped_cmd)
             self.assertIn(HostExecutor._SENTINEL, wrapped_cmd)
 

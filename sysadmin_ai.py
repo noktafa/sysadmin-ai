@@ -200,7 +200,7 @@ BLOCKED_PATTERNS = [
     (r"chown\s+(-[a-zA-Z]*\s+)*\S+\s+/(etc|usr|var|boot|sys|proc)(\s|/|$)", "Ownership change on system directory"),
     (r">\s*/etc/(passwd|shadow|fstab|hosts)", "Overwriting critical system file"),
     (r"kill\s+(-[0-9]*\s+)?-?1$", "Killing init or all processes"),
-    (r"\b(shutdown|poweroff|halt)\b", "System shutdown/poweroff"),
+    (r"^\s*(sudo\s+)?(shutdown|poweroff|halt)\b", "System shutdown/poweroff"),
     (r"\binit\s+[06]\b", "System halt/reboot via init"),
     # Network attacks
     (r"curl\s+.*\|\s*(ba)?sh", "Remote script execution via curl"),
@@ -334,13 +334,15 @@ class HostExecutor(Executor):
                 f"|| (echo {self._SENTINEL}_1 & cd)"
             )
         else:
-            # Use && / || to encode exit status in the sentinel, matching
-            # the Windows format so the parsing logic is identical.
+            # Use a variable to capture the command's exit status, then
+            # emit the sentinel and pwd.  The command must NOT run in a
+            # subshell so that 'cd' side-effects are visible to 'pwd'.
             wrapped = (
-                f"({command}) "
-                f"&& echo {self._SENTINEL}_0 "
-                f"|| echo {self._SENTINEL}_1\n"
-                f"pwd"
+                f"{command}\n"
+                f"__sa_exit=$?\n"
+                f'if [ "$__sa_exit" -eq 0 ]; then echo {self._SENTINEL}_0; else echo {self._SENTINEL}_1; fi\n'
+                f"pwd\n"
+                f"exit $__sa_exit"
             )
         try:
             result = subprocess.run(
@@ -414,8 +416,15 @@ class DockerExecutor(Executor):
     def execute(self, command, cwd=None):
         """Executes a command inside the Docker container."""
         cwd = cwd or "/root"
-        # Append pwd to track directory changes
-        wrapped = f"({command})\necho {self._SENTINEL}\npwd"
+        # Append pwd to track directory changes.
+        # Do NOT wrap in a subshell — cd must be visible to pwd.
+        wrapped = (
+            f"{command}\n"
+            f"__sa_exit=$?\n"
+            f"echo {self._SENTINEL}\n"
+            f"pwd\n"
+            f"exit $__sa_exit"
+        )
         print(f"\033[93m[EXEC container]\033[0m {command}")
         try:
             result = subprocess.run(
@@ -585,18 +594,23 @@ def _check_read_safety(full_path):
         ("safe", None)      - read can proceed
     """
     normalized = full_path.replace("\\", "/")
+    # On macOS, /etc -> /private/etc after realpath resolution
+    if _IS_MACOS and normalized.startswith("/private/etc/"):
+        normalized = normalized[len("/private"):]
+    # Case-insensitive comparison for Windows paths
+    norm_lower = normalized.lower()
     blocked_exact = ["/etc/shadow", "/etc/gshadow"]
     blocked_fragments = [".ssh/id_", "/etc/ssh/ssh_host_"]
     if _IS_WINDOWS:
-        blocked_fragments += ["\\SAM", "/SAM"]
+        blocked_fragments += ["/sam", "/ntds.dit"]
     if _IS_MACOS:
-        blocked_fragments += ["/Library/Keychains/", "Keychains/login.keychain"]
+        blocked_fragments += ["/library/keychains/", "keychains/login.keychain"]
 
     for exact in blocked_exact:
-        if normalized == exact:
+        if norm_lower == exact:
             return "blocked", f"Reading {exact} is blocked for safety"
     for frag in blocked_fragments:
-        if frag in normalized:
+        if frag in norm_lower:
             return "blocked", f"Reading sensitive file matching '{frag}'"
     return "safe", None
 
@@ -613,6 +627,11 @@ def _check_write_safety(full_path):
         ("safe", None)      - write can proceed
     """
     normalized = full_path.replace("\\", "/")
+    # On macOS, /etc -> /private/etc after realpath resolution
+    if _IS_MACOS and normalized.startswith("/private/etc/"):
+        normalized = normalized[len("/private"):]
+    # Case-insensitive + drive-letter-agnostic for Windows
+    norm_lower = normalized.lower()
     blocked_prefixes = [
         "/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/",
         "/boot/", "/proc/", "/sys/", "/dev/",
@@ -622,26 +641,29 @@ def _check_write_safety(full_path):
         "/etc/gshadow", "/etc/sudoers",
     ]
     if _IS_WINDOWS:
-        blocked_prefixes += [
-            "C:/Windows/", "C:/Program Files/", "C:/Program Files (x86)/",
-        ]
+        # Strip drive letter for prefix matching (C:/Windows -> /windows)
+        path_no_drive = re.sub(r"^[a-z]:", "", norm_lower)
+        blocked_prefixes += ["/windows/", "/program files/", "/program files (x86)/"]
+    else:
+        path_no_drive = norm_lower
     if _IS_MACOS:
-        blocked_prefixes += ["/System/", "/Library/Keychains/"]
+        blocked_prefixes += ["/system/", "/library/keychains/"]
 
     for prefix in blocked_prefixes:
-        if normalized.startswith(prefix):
+        if path_no_drive.startswith(prefix):
             return "blocked", f"Writing to system path {prefix}"
     for exact in blocked_exact:
-        if normalized == exact:
+        if norm_lower == exact:
             return "blocked", f"Writing to critical system file {exact}"
 
     confirm_prefixes = ["/etc/"]
     if _IS_WINDOWS:
-        confirm_prefixes += ["C:/ProgramData/"]
+        confirm_prefixes += ["/programdata/"]
     if _IS_MACOS:
-        confirm_prefixes += ["/Library/", "/Applications/"]
+        confirm_prefixes += ["/library/", "/applications/"]
     for prefix in confirm_prefixes:
-        if normalized.startswith(prefix):
+        check_path = path_no_drive if _IS_WINDOWS else norm_lower
+        if check_path.startswith(prefix):
             return "confirm", f"Writing to system config directory ({prefix})"
 
     if os.path.exists(full_path):
