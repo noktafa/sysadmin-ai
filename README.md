@@ -125,7 +125,7 @@ Both tiers include OS-specific patterns:
 | Category | Linux / macOS | Windows |
 |----------|--------------|---------|
 | Destructive ops | `rm -rf /`, `mkfs`, `dd`, `shred` | `format C:`, `del /s`, `rd /s`, `diskpart`, `Remove-Item -Recurse` |
-| System sabotage | `chmod 000`, `kill -9 1`, `shutdown` | `Stop-Computer`, `bcdedit`, `reg delete HKLM` |
+| System sabotage | `chmod 000`, `kill -9 1`, `shutdown` (command-start only) | `Stop-Computer`, `bcdedit`, `reg delete HKLM` |
 | Credential access | `cat /etc/shadow`, SSH keys | SAM/NTDS dump, `mimikatz`, Wi-Fi passwords |
 | Privilege escalation | `sudo su`, SUID/SGID | Admin account creation, UAC bypass |
 | Network attacks | `curl \| bash`, reverse shells | `Invoke-WebRequest \| Invoke-Expression` |
@@ -165,14 +165,16 @@ File tools have their own safety checks, mirroring the shell command safety filt
 - `/etc/shadow`, `/etc/gshadow` (password hashes)
 - `.ssh/id_*` (SSH private keys)
 - `/etc/ssh/ssh_host_*` (SSH host keys)
-- SAM database paths (Windows)
+- SAM database, NTDS.dit (Windows)
 - Keychain files (macOS)
+
+All path matching is case-insensitive and drive-letter-agnostic on Windows (e.g., `D:\WINDOWS\` is caught, not just `C:\Windows\`). On macOS, `/private/etc` is normalized to `/etc` after `realpath` resolution so symlink-based bypasses are prevented.
 
 **Write safety** — two-tier blocked/confirm system:
 
 | Tier | Paths | Action |
 |------|-------|--------|
-| Blocked | `/bin/`, `/sbin/`, `/usr/bin/`, `/boot/`, `/proc/`, `/sys/`, `/dev/`, `C:\Windows\`, `C:\Program Files\`, `/System/` (macOS), `/Library/Keychains/` (macOS) | Write rejected unconditionally |
+| Blocked | `/bin/`, `/sbin/`, `/usr/bin/`, `/boot/`, `/proc/`, `/sys/`, `/dev/`, `<drive>:\Windows\`, `<drive>:\Program Files\` (any drive letter, case-insensitive), `/System/` (macOS), `/Library/Keychains/` (macOS) | Write rejected unconditionally |
 | Blocked | `/etc/passwd`, `/etc/shadow`, `/etc/fstab`, `/etc/gshadow`, `/etc/sudoers` | Write rejected unconditionally |
 | Confirm | `/etc/*`, `C:\ProgramData\*`, `/Library/*` (macOS), `/Applications/*` (macOS) | User prompted `y/N` before write |
 | Confirm | Any existing file (overwrite) | User prompted `y/N` before write |
@@ -238,9 +240,19 @@ Run the full test suite:
 python -m pytest tests/ -v
 ```
 
-54 tests across 8 classes: safety filter, shell execution, PowerShell wrapping, Windows execution, CWD tracking, encoding, message history trimming, and log redaction. One test (Unix `cd` tracking) is automatically skipped on Windows.
+110 tests across 16 classes covering safety filters, shell execution, PowerShell wrapping, Windows execution, CWD tracking, encoding, message history trimming, log redaction, executor abstraction, file I/O, path traversal, symlink safety, and platform constants. Windows-only and macOS-only tests are automatically skipped on other platforms.
 
 ## Release Notes
+
+### v0.13.0
+
+- **Fix subshell CWD bug in both executors** — `HostExecutor` and `DockerExecutor` wrapped commands in a subshell `(command)`, which discarded `cd` side-effects before `pwd` ran. Commands now run without subshell wrapping, using `$?` to capture exit status instead.
+- **Case-insensitive path safety on Windows** — `_check_read_safety` and `_check_write_safety` now compare paths case-insensitively. `D:\WINDOWS\system32` and `c:\windows\System32` are both correctly blocked.
+- **Drive-letter-agnostic write safety** — Windows write safety no longer hardcodes `C:`. Any drive letter (`D:\Windows\`, `E:\Program Files\`) is caught by stripping the drive prefix before matching.
+- **NTDS.dit added to read blocklist** — the Windows Active Directory credential database is now blocked alongside SAM.
+- **macOS `/private/etc` normalization** — after `realpath` resolves `/etc` → `/private/etc` on macOS, both safety checkers strip the `/private` prefix so rules for `/etc/shadow`, `/etc/passwd` etc. still match.
+- **Shutdown pattern narrowed** — `shutdown`, `poweroff`, `halt` are now only blocked when they appear at the start of a command (with optional `sudo` prefix). `grep shutdown /var/log/syslog` and `journalctl | grep halt` are no longer false-positived.
+- **110 tests passing** — test suite updated to match new sentinel format; all symlink, path traversal, and safety tests pass on Linux, macOS, and Windows.
 
 ### v0.12.0
 
