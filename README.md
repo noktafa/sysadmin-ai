@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="logo.png" alt="SysAdmin AI" width="512">
+<img src="logo.png" alt="SysAdmin AI" width="256">
 
 # SysAdmin AI
 
