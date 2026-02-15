@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="logo.png" alt="SysAdmin AI" width="512">
+
 # SysAdmin AI
 
 **Stateless Executor / Context-Aware Administration Interface**
