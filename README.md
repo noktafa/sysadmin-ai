@@ -1,16 +1,49 @@
+<div align="center">
+
 # SysAdmin AI
 
-> SysAdmin AI, sunucu yönetimini güvenli ve öngörülebilir kılmak amacıyla tasarlanmış, komutları bağımsız başlangıçlarla yürüten bir terminal asistanıdır.
-> Oturum hatalarını önlemek için işlemleri sırayla, kullanıcının gözetiminde gerçekleştirir ve "durumsuz" (stateless) bir yapı benimser; her komut, izole bir süreçte çalıştırılır.
->
-> Tasarım felsefesi gereği olarak sunucunun bütünlüğünü korumayı otonom yeteneklere tercih eder.
+**Stateless Executor / Context-Aware Administration Interface**
 
-> SysAdmin AI is a terminal assistant designed to make server administration safe and predictable, executing commands with independent starts.
-> To prevent session errors, it performs operations sequentially under user supervision and adopts a stateless architecture — each command runs in an isolated process.
->
-> By design, it prioritizes preserving server integrity over autonomous capabilities.
+[![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white)](#)
+[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-informational)](#)
+[![License](https://img.shields.io/badge/License-MIT-green)](#)
 
-LLM-powered system administration assistant that runs locally on your machine.
+</div>
+
+---
+
+> **TR** &mdash; SysAdmin AI; tasarımında operasyonel güvenliği ve sunucu bütünlüğünü otonom yeteneklerin önünde tutan, durumsuz yürütücü (stateless executor) tabanlı bir yönetim arayüzüdür. Bu yapısına rağmen sahip olduğu bağlam farkındalığı (context-aware) sayesinde; her komutu bağımsız bir yalıtılmış alan (sandbox) veya ana makine süreci (host process) içerisinde yürüterek öngörülebilir bir yönetim katmanı sağlar.
+
+> **EN** &mdash; SysAdmin AI is a stateless-executor-based administration interface that prioritizes operational safety and server integrity over autonomous capabilities. Despite this stateless architecture, its context-aware design executes every command within an independent sandbox or host process, providing a predictable and auditable management layer.
+
+### Key Design Principles
+
+| Principle | Implementation |
+|-----------|---------------|
+| **Stateless execution** | Each command runs in an isolated `subprocess` &mdash; no persistent shell, no accumulated hidden state |
+| **Context awareness** | Python-side CWD tracking + session state gives the feel of a persistent shell without the risks |
+| **Safety-first** | Two-tier blocklist/graylist filter with 40+ regex patterns intercepts dangerous commands before execution |
+| **Dual execution backends** | `HostExecutor` (direct subprocess) or `DockerExecutor` (disposable container) via Strategy Pattern |
+| **Native file I/O** | Dedicated `read_file` / `write_file` tools bypass the shell entirely &mdash; no escaping issues |
+| **Audit trail** | Structured JSONL logging with automatic secret redaction (18 patterns) |
+| **Cross-platform** | OS-aware safety rules, prompts, and command wrapping for Linux, macOS, and Windows |
+
+### Architecture Overview
+
+```
+User ──> LLM (OpenAI / vLLM) ──> Safety Filter ──> Executor ──> OS
+              │                     │                  │
+              │                     │           ┌──────┴──────┐
+              │                     │      HostExecutor   DockerExecutor
+              │                     │      (subprocess)   (docker exec)
+              │                     │
+              │               Blocklist (reject)
+              │               Graylist  (confirm)
+              │
+         read_file / write_file ──> Python I/O (no shell)
+```
+
+---
 
 ## Usage
 
