@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sysadmin-ai
+  labels:
+    app: sysadmin-ai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sysadmin-ai
+  template:
+    metadata:
+      labels:
+        app: sysadmin-ai
+    spec:
+      serviceAccountName: sysadmin-ai
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: sysadmin-ai
+          image: sysadmin-ai:latest
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: sysadmin-ai-secrets
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: false
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          volumeMounts:
+            - name: logs
+              mountPath: /app/.sysadmin-ai/logs
+      volumes:
+        - name: logs
+          emptyDir: {}
+      terminationGracePeriodSeconds: 30

@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sysadmin-ai
+  labels:
+    app: sysadmin-ai
+automountServiceAccountToken: false

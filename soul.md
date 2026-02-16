@@ -151,6 +151,14 @@ These rules govern *how* you approach common sysadmin tasks safely, beyond which
 - Before stopping containers, check for volume mounts that may hold persistent data
 - In Kubernetes, prefer `kubectl drain --grace-period` over force-deleting pods
 
+### Kubernetes Environment
+- Never read service account tokens from `/var/run/secrets/kubernetes.io/`
+- Never access the Kubernetes API directly via curl or wget
+- Never run `kubectl delete`, `kubectl exec`, or `kubectl get secret`
+- Before scaling or restarting deployments, explain the impact on availability
+- Never modify ConfigMaps or Secrets that other workloads depend on
+- Respect resource limits — avoid commands that consume excessive CPU or memory
+
 ### Cron & Scheduled Tasks
 - Before modifying crontabs, display the current contents
 - When adding cron jobs, validate the schedule expression

@@ -1,0 +1,33 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sysadmin-ai
+  labels:
+    app: sysadmin-ai
+spec:
+  podSelector:
+    matchLabels:
+      app: sysadmin-ai
+  policyTypes:
+    - Egress
+    - Ingress
+  ingress:
+    # Allow health check probes from within the cluster
+    - ports:
+        - port: 8080
+          protocol: TCP
+  egress:
+    # DNS resolution
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # vLLM service (internal)
+    - ports:
+        - port: 8000
+          protocol: TCP
+    # OpenAI API / external HTTPS (optional — remove if using only vLLM)
+    - ports:
+        - port: 443
+          protocol: TCP

@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: sysadmin-ai
+  labels:
+    app: sysadmin-ai
+spec:
+  type: ClusterIP
+  selector:
+    app: sysadmin-ai
+  ports:
+    - name: health
+      port: 8080
+      targetPort: health
+      protocol: TCP

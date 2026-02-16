@@ -1,0 +1,11 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sysadmin-ai
+  labels:
+    app: sysadmin-ai
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: sysadmin-ai

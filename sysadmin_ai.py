@@ -6,6 +6,9 @@ import argparse
 import subprocess
 import json
 import logging
+import signal
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -49,11 +52,14 @@ class JSONLFormatter(logging.Formatter):
         return json.dumps(entry, default=str)
 
 
-def setup_logging(log_dir=None):
+def setup_logging(log_dir=None, log_stdout=False):
     """Configure a JSONL file logger for the session.
 
     Returns the logger instance. Each session writes to a separate file:
     ``<log_dir>/session_<YYYYMMDD_HHMMSS>.jsonl``
+
+    When *log_stdout* is True (or when running inside Kubernetes), a second
+    handler writes JSONL to stderr for log aggregators like Fluentd/Loki.
     """
     log_dir = log_dir or DEFAULT_LOG_DIR
     os.makedirs(log_dir, exist_ok=True)
@@ -67,6 +73,12 @@ def setup_logging(log_dir=None):
     handler = logging.FileHandler(log_file, encoding="utf-8")
     handler.setFormatter(JSONLFormatter())
     logger.addHandler(handler)
+
+    # Structured stderr logging for K8s log aggregators
+    if log_stdout or os.environ.get("KUBERNETES_SERVICE_HOST"):
+        stderr_handler = logging.StreamHandler(sys.stderr)
+        stderr_handler.setFormatter(JSONLFormatter())
+        logger.addHandler(stderr_handler)
 
     return logger
 
@@ -181,6 +193,10 @@ def parse_args():
     parser.add_argument("--log-dir", help=f"Override log directory (default: {DEFAULT_LOG_DIR})")
     parser.add_argument("--safe-mode", action="store_true", default=False,
         help="Run commands inside a Docker container instead of directly on the host")
+    parser.add_argument("--log-stdout", action="store_true", default=False,
+        help="Also emit structured JSON logs to stderr (auto-enabled in K8s)")
+    parser.add_argument("--health-port", type=int, default=8080,
+        help="Port for /healthz and /readyz endpoints (0 to disable, default: 8080)")
     return parser.parse_args()
 
 # --- COMMAND SAFETY ---
@@ -232,6 +248,22 @@ BLOCKED_PATTERNS = [
     (r"\bdiskpart\b", "Disk partition manipulation"),
     (r"Remove-Item\s+.*[\\\/](Windows|Program Files|Users).*-Recurse|Remove-Item\s+.*-Recurse.*[\\\/](Windows|Program Files|Users)", "Recursive deletion of system directory"),
     (r"\bStop-Computer\b", "System shutdown via PowerShell"),
+    # --- Kubernetes-specific ---
+    (r"\bkubectl\s+(delete|drain|cordon|taint|replace)\b", "Destructive kubectl operation"),
+    (r"\bkubectl\s+exec\b", "kubectl exec into other pods"),
+    (r"\bkubectl\s+(get|describe)\s+secret", "Accessing Kubernetes secrets"),
+    (r"\bkubectl\s+apply\s+.*--force", "Force-applying Kubernetes resources"),
+    (r"\bkubectl\s+edit\b", "Interactive kubectl edit"),
+    (r"\bhelm\s+(delete|uninstall|rollback)\b", "Destructive Helm operation"),
+    # Kubernetes service account token access
+    (r"cat\s+.*/var/run/secrets/kubernetes\.io/", "Reading Kubernetes service account token"),
+    (r"curl\s+.*kubernetes\.default", "Direct Kubernetes API access via curl"),
+    # Docker socket (container escape)
+    (r"docker\s+.*-v\s+/var/run/docker\.sock", "Mounting Docker socket"),
+    (r"cat\s+.*/var/run/docker\.sock", "Reading Docker socket"),
+    # Process environment (secret leakage)
+    (r"cat\s+.*/proc/\d+/environ", "Reading process environment variables"),
+    (r"cat\s+.*/proc/self/environ", "Reading own environment variables"),
 ]
 
 # Commands that require user confirmation before execution
@@ -250,6 +282,9 @@ GRAYLIST_PATTERNS = [
     (r"\bStop-Service\b", "Service stop via PowerShell"),
     (r"\bnet\s+stop\b", "Service stop via net"),
     (r"\breg\s+delete\b", "Registry key deletion"),
+    # --- Kubernetes-specific ---
+    (r"\bkubectl\s+scale\b", "Scaling Kubernetes resources"),
+    (r"\bkubectl\s+rollout\s+restart\b", "Restarting Kubernetes rollout"),
 ]
 
 
@@ -468,6 +503,145 @@ class DockerExecutor(Executor):
             pass
 
 
+class KubernetesExecutor(Executor):
+    """Runs commands inside an ephemeral Kubernetes pod (--safe-mode in K8s)."""
+
+    _SENTINEL = "__K8S_PWD__"
+
+    def __init__(self, namespace=None):
+        try:
+            from kubernetes import client, config
+            from kubernetes.stream import stream
+        except ImportError:
+            raise RuntimeError(
+                "The 'kubernetes' package is required for K8s safe mode. "
+                "Install it with: pip install kubernetes>=28.0.0"
+            )
+
+        # Load in-cluster config (from service account) or local kubeconfig
+        try:
+            config.load_incluster_config()
+        except config.ConfigException:
+            config.load_kube_config()
+
+        self._core_api = client.CoreV1Api()
+        self._stream = stream
+        self._namespace = namespace or self._detect_namespace()
+        self._pod_name = f"sysadmin-ai-sandbox-{SESSION_ID.lower().replace('_', '-')}"
+
+        # Create a sandbox pod
+        pod_manifest = client.V1Pod(
+            metadata=client.V1ObjectMeta(
+                name=self._pod_name,
+                namespace=self._namespace,
+                labels={"app": "sysadmin-ai-sandbox"},
+            ),
+            spec=client.V1PodSpec(
+                automount_service_account_token=False,
+                containers=[
+                    client.V1Container(
+                        name="sandbox",
+                        image="ubuntu:22.04",
+                        command=["sleep", "infinity"],
+                        security_context=client.V1SecurityContext(
+                            run_as_user=1000,
+                            run_as_non_root=True,
+                            allow_privilege_escalation=False,
+                            capabilities=client.V1Capabilities(drop=["ALL"]),
+                        ),
+                    )
+                ],
+                restart_policy="Never",
+            ),
+        )
+        self._core_api.create_namespaced_pod(
+            namespace=self._namespace, body=pod_manifest
+        )
+
+        # Wait for pod to be running
+        import time
+        for _ in range(60):
+            pod = self._core_api.read_namespaced_pod(
+                name=self._pod_name, namespace=self._namespace
+            )
+            if pod.status.phase == "Running":
+                break
+            time.sleep(1)
+        else:
+            self.cleanup()
+            raise RuntimeError("Sandbox pod did not reach Running state within 60s")
+
+    @staticmethod
+    def _detect_namespace():
+        """Detect the current K8s namespace from the service account mount."""
+        ns_file = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+        try:
+            with open(ns_file, "r") as f:
+                return f.read().strip()
+        except FileNotFoundError:
+            return "default"
+
+    def execute(self, command, cwd=None):
+        """Execute a command inside the sandbox pod via exec."""
+        from kubernetes.stream import stream as k8s_stream
+
+        cwd = cwd or "/tmp"
+        wrapped = (
+            f"cd {cwd} 2>/dev/null; {command}\n"
+            f"__sa_exit=$?\n"
+            f"echo {self._SENTINEL}\n"
+            f"pwd\n"
+            f"exit $__sa_exit"
+        )
+        print(f"\033[93m[EXEC k8s-pod]\033[0m {command}")
+        try:
+            resp = k8s_stream(
+                self._core_api.connect_get_namespaced_pod_exec,
+                self._pod_name,
+                self._namespace,
+                container="sandbox",
+                command=["sh", "-c", wrapped],
+                stderr=True,
+                stdin=False,
+                stdout=True,
+                tty=False,
+                _request_timeout=30,
+            )
+            stdout = resp if isinstance(resp, str) else str(resp)
+            new_cwd = None
+
+            if self._SENTINEL in stdout:
+                before, _, after = stdout.partition(self._SENTINEL)
+                pwd_line = after.strip().split("\n")[0].strip()
+                if pwd_line and os.path.isabs(pwd_line):
+                    new_cwd = pwd_line
+                stdout = before
+
+            output = stdout
+            if not output.strip():
+                output = "(No output)"
+            elif len(output) > MAX_OUTPUT_CHARS:
+                output = output[:MAX_OUTPUT_CHARS] + f"\n... (truncated, {len(output)} chars total)"
+
+            status = "success"
+            return output, status, new_cwd
+        except Exception as e:
+            error_str = str(e)
+            if "timed out" in error_str.lower() or "timeout" in error_str.lower():
+                return "Error: Command timed out after 30 seconds.", "timeout", None
+            return f"Error executing command: {error_str}", "error", None
+
+    def cleanup(self):
+        """Delete the sandbox pod."""
+        try:
+            self._core_api.delete_namespaced_pod(
+                name=self._pod_name,
+                namespace=self._namespace,
+            )
+        except Exception:
+            pass
+
+
 def load_safety_rules():
     """Load soul.md safety rules to include in the system prompt."""
     soul_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "soul.md")
@@ -476,6 +650,43 @@ def load_safety_rules():
             return f.read()
     except FileNotFoundError:
         return ""
+
+
+# --- HEALTH ENDPOINT ---
+
+class HealthHandler(BaseHTTPRequestHandler):
+    """Lightweight HTTP handler for K8s liveness and readiness probes."""
+
+    ready = False
+
+    def do_GET(self):
+        if self.path == "/healthz":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+        elif self.path == "/readyz":
+            if HealthHandler.ready:
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+            else:
+                self.send_response(503)
+                self.end_headers()
+                self.wfile.write(b"not ready")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass  # Suppress access logs
+
+
+def start_health_server(port=8080):
+    """Start the health check HTTP server in a daemon thread."""
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
 
 
 # --- SYSTEM CONTEXT ---
@@ -600,7 +811,12 @@ def _check_read_safety(full_path):
     # Case-insensitive comparison for Windows paths
     norm_lower = normalized.lower()
     blocked_exact = ["/etc/shadow", "/etc/gshadow"]
-    blocked_fragments = [".ssh/id_", "/etc/ssh/ssh_host_"]
+    blocked_fragments = [
+        ".ssh/id_", "/etc/ssh/ssh_host_",
+        "/var/run/secrets/kubernetes.io/",
+        "/proc/self/environ",
+        "/proc/1/environ",
+    ]
     if _IS_WINDOWS:
         blocked_fragments += ["/sam", "/ntds.dit"]
     if _IS_MACOS:
@@ -749,11 +965,28 @@ def trim_message_history(messages):
 # --- CHAT LOOP ---
 def chat_loop():
     args = parse_args()
+
+    def _handle_sigterm(signum, frame):
+        """Graceful shutdown on SIGTERM (K8s pod eviction)."""
+        print("\n\033[93m[SIGTERM]\033[0m Shutting down gracefully...")
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
     client, model_name, base_url = build_client(args)
-    logger = setup_logging(args.log_dir)
+    logger = setup_logging(args.log_dir, log_stdout=args.log_stdout)
+
+    # Start health endpoint if enabled
+    _health_server = None
+    in_k8s = bool(os.environ.get("KUBERNETES_SERVICE_HOST"))
+    if args.health_port and (args.health_port > 0 or in_k8s):
+        _health_server = start_health_server(port=args.health_port)
 
     if args.safe_mode:
-        executor = DockerExecutor()
+        if os.path.exists("/var/run/secrets/kubernetes.io/serviceaccount"):
+            executor = KubernetesExecutor()
+        else:
+            executor = DockerExecutor()
     else:
         executor = HostExecutor()
 
@@ -823,6 +1056,9 @@ def chat_loop():
     print(f"\033[90m  endpoint: {base_url}\033[0m")
     if args.safe_mode:
         print("\033[93m[SAFE MODE]\033[0m Commands run inside Docker container")
+
+    # Mark ready for K8s readiness probe
+    HealthHandler.ready = True
 
     try:
         while True:
@@ -1098,6 +1334,9 @@ def chat_loop():
 
     finally:
         executor.cleanup()
+        for handler in logger.handlers:
+            handler.flush()
+            handler.close()
 
 if __name__ == "__main__":
     chat_loop()
