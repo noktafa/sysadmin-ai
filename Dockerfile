@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-RUN groupadd -r sysadmin && useradd -r -g sysadmin -m -d /app sysadmin
+RUN groupadd -r -g 1000 sysadmin && useradd -r -u 1000 -g sysadmin -m -d /app sysadmin
 
 WORKDIR /app
 COPY requirements.txt .

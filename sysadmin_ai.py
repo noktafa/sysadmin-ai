@@ -17,6 +17,7 @@ from openai import OpenAI, APIConnectionError, APIStatusError, APITimeoutError, 
 # --- SETTINGS ---
 MAX_OUTPUT_CHARS = 8000  # Truncate long command output to protect context window
 MAX_HISTORY_MESSAGES = 80  # Trim older messages to stay within context limits
+DEFAULT_COMMAND_TIMEOUT = 30  # Seconds before a command is killed
 DEFAULT_LOG_DIR = os.path.join(Path.home(), ".sysadmin-ai", "logs")
 _IS_WINDOWS = platform.system() == "Windows"
 _IS_MACOS = platform.system() == "Darwin"
@@ -197,6 +198,11 @@ def parse_args():
         help="Also emit structured JSON logs to stderr (auto-enabled in K8s)")
     parser.add_argument("--health-port", type=int, default=8080,
         help="Port for /healthz and /readyz endpoints (0 to disable, default: 8080)")
+    parser.add_argument("--health-bind", default=None,
+        help="Bind address for health endpoint (default: 127.0.0.1, or 0.0.0.0 in K8s)")
+    parser.add_argument("--command-timeout", type=int,
+        default=int(os.environ.get("SYSADMIN_AI_COMMAND_TIMEOUT", str(DEFAULT_COMMAND_TIMEOUT))),
+        help=f"Seconds before a running command is killed (default: {DEFAULT_COMMAND_TIMEOUT})")
     return parser.parse_args()
 
 # --- COMMAND SAFETY ---
@@ -228,6 +234,15 @@ BLOCKED_PATTERNS = [
     (r"cat\s+.*/etc/(shadow|gshadow)", "Reading password shadow file"),
     (r"cat\s+.*\.ssh/id_", "Reading SSH private key"),
     (r"cat\s+.*/etc/ssh/ssh_host_.*_key(\s|$)", "Reading SSH host private key"),
+    # Alternative readers targeting sensitive files
+    (r"\b(less|more|head|tail|tac|nl)\s+.*/etc/(shadow|gshadow)", "Reading password file with alternative reader"),
+    (r"\b(strings|xxd|hexdump|od)\s+.*/etc/(shadow|gshadow)", "Reading password file with binary reader"),
+    (r"\b(grep|awk|sed)\s+.*/etc/(shadow|gshadow)", "Extracting from password file"),
+    (r"\b(less|more|head|tail|tac|nl|strings|xxd|hexdump|od|grep|awk|sed)\s+.*\.ssh/id_", "Reading SSH private key with alternative reader"),
+    (r"\b(less|more|head|tail|tac|nl|strings|xxd|hexdump|od|grep|awk|sed)\s+.*/etc/ssh/ssh_host_.*_key(\s|$)", "Reading SSH host key with alternative reader"),
+    (r"\b(less|more|head|tail|tac|nl|strings|xxd|hexdump|od|grep|awk|sed|cat)\s+.*/var/run/secrets/kubernetes\.io/", "Reading Kubernetes secrets with alternative reader"),
+    (r"\b(less|more|head|tail|tac|nl|strings|xxd|hexdump|od|grep|awk|sed|cat)\s+.*/proc/\d+/environ", "Reading process environment with alternative reader"),
+    (r"\b(less|more|head|tail|tac|nl|strings|xxd|hexdump|od|grep|awk|sed|cat)\s+.*/proc/self/environ", "Reading own environment with alternative reader"),
     # Privilege escalation
     (r"sudo\s+su(\s|$)", "Unrestricted root shell via sudo su"),
     (r"sudo\s+(-\w+\s+)*bash", "Unrestricted root shell via sudo bash"),
@@ -264,6 +279,9 @@ BLOCKED_PATTERNS = [
     # Process environment (secret leakage)
     (r"cat\s+.*/proc/\d+/environ", "Reading process environment variables"),
     (r"cat\s+.*/proc/self/environ", "Reading own environment variables"),
+    # --- Shell obfuscation ---
+    (r"\$'\\x[0-9a-fA-F]{2}", "Bash hex escape obfuscation ($'\\xNN')"),
+    (r"\$'\\[0-7]{3}", "Bash octal escape obfuscation ($'\\NNN')"),
     # --- Interpreter evasion ---
     (r"\bpython3?\s+-c\b", "Python inline code execution"),
     (r"\bperl\s+-e\b", "Perl inline code execution"),
@@ -349,8 +367,15 @@ class Executor(ABC):
     """Strategy interface for command execution."""
 
     @abstractmethod
-    def execute(self, command, cwd=None):
-        """Returns (output, status, new_cwd)."""
+    def execute(self, command, cwd=None, timeout=None):
+        """Returns (output, status, new_cwd).
+
+        Args:
+            command: The shell command to run.
+            cwd: Working directory for the command.
+            timeout: Seconds before the command is killed.  Falls back to
+                     ``DEFAULT_COMMAND_TIMEOUT`` when *None*.
+        """
         ...
 
     def cleanup(self):
@@ -382,13 +407,14 @@ class HostExecutor(Executor):
             return True
         return False
 
-    def execute(self, command, cwd=None):
+    def execute(self, command, cwd=None, timeout=None):
         """Executes a command and returns (output, status, new_cwd).
 
         Appends a pwd sentinel after the command to track directory changes.
         ``new_cwd`` is the working directory after the command ran, or None if
         it could not be determined.
         """
+        timeout = timeout if timeout is not None else DEFAULT_COMMAND_TIMEOUT
         # Auto-wrap bare PowerShell cmdlets so they work under cmd.exe
         if self._needs_powershell_wrap(command):
             command = f'powershell -NoProfile -Command "{command}"'
@@ -419,7 +445,7 @@ class HostExecutor(Executor):
             )
         try:
             result = subprocess.run(
-                wrapped, shell=True, capture_output=True, timeout=30,
+                wrapped, shell=True, capture_output=True, timeout=timeout,
                 cwd=cwd, encoding="utf-8", errors="replace",
             )
             stdout = result.stdout or ""
@@ -454,7 +480,7 @@ class HostExecutor(Executor):
             status = "exit_1" if cmd_failed else "success"
             return output, status, new_cwd
         except subprocess.TimeoutExpired:
-            return "Error: Command timed out after 30 seconds.", "timeout", None
+            return f"Error: Command timed out after {timeout} seconds.", "timeout", None
         except Exception as e:
             return f"Error executing command: {str(e)}", "error", None
 
@@ -486,8 +512,9 @@ class DockerExecutor(Executor):
             capture_output=True, check=True, timeout=60,
         )
 
-    def execute(self, command, cwd=None):
+    def execute(self, command, cwd=None, timeout=None):
         """Executes a command inside the Docker container."""
+        timeout = timeout if timeout is not None else DEFAULT_COMMAND_TIMEOUT
         cwd = cwd or "/root"
         # Append pwd to track directory changes.
         # Do NOT wrap in a subshell — cd must be visible to pwd.
@@ -503,7 +530,7 @@ class DockerExecutor(Executor):
             result = subprocess.run(
                 ["docker", "exec", "--workdir", cwd, self._container,
                  "sh", "-c", wrapped],
-                capture_output=True, timeout=30,
+                capture_output=True, timeout=timeout,
                 encoding="utf-8", errors="replace",
             )
             stdout = result.stdout or ""
@@ -526,7 +553,7 @@ class DockerExecutor(Executor):
             status = "exit_1" if result.returncode != 0 else "success"
             return output, status, new_cwd
         except subprocess.TimeoutExpired:
-            return "Error: Command timed out after 30 seconds.", "timeout", None
+            return f"Error: Command timed out after {timeout} seconds.", "timeout", None
         except Exception as e:
             return f"Error executing command: {str(e)}", "error", None
 
@@ -619,10 +646,11 @@ class KubernetesExecutor(Executor):
         except FileNotFoundError:
             return "default"
 
-    def execute(self, command, cwd=None):
+    def execute(self, command, cwd=None, timeout=None):
         """Execute a command inside the sandbox pod via exec."""
         from kubernetes.stream import stream as k8s_stream
 
+        timeout = timeout if timeout is not None else DEFAULT_COMMAND_TIMEOUT
         cwd = cwd or "/tmp"
         wrapped = (
             f"cd {cwd} 2>/dev/null; {command}\n"
@@ -643,7 +671,7 @@ class KubernetesExecutor(Executor):
                 stdin=False,
                 stdout=True,
                 tty=False,
-                _request_timeout=30,
+                _request_timeout=timeout,
             )
             stdout = resp if isinstance(resp, str) else str(resp)
             new_cwd = None
@@ -666,7 +694,7 @@ class KubernetesExecutor(Executor):
         except Exception as e:
             error_str = str(e)
             if "timed out" in error_str.lower() or "timeout" in error_str.lower():
-                return "Error: Command timed out after 30 seconds.", "timeout", None
+                return f"Error: Command timed out after {timeout} seconds.", "timeout", None
             return f"Error executing command: {error_str}", "error", None
 
     def cleanup(self):
@@ -719,9 +747,17 @@ class HealthHandler(BaseHTTPRequestHandler):
         pass  # Suppress access logs
 
 
-def start_health_server(port=8080):
-    """Start the health check HTTP server in a daemon thread."""
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+def start_health_server(port=8080, bind_address=None):
+    """Start the health check HTTP server in a daemon thread.
+
+    Args:
+        port: TCP port to listen on.
+        bind_address: IP address to bind to.  Defaults to ``0.0.0.0`` when
+                      running inside Kubernetes, ``127.0.0.1`` otherwise.
+    """
+    if bind_address is None:
+        bind_address = "0.0.0.0" if os.environ.get("KUBERNETES_SERVICE_HOST") else "127.0.0.1"
+    server = HTTPServer((bind_address, port), HealthHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server
@@ -826,8 +862,9 @@ def _needs_powershell_wrap(command):
 _host_executor = HostExecutor()
 
 
-def run_shell_command(command, cwd=None):
-    return _host_executor.execute(command, cwd=cwd)
+def run_shell_command(command, cwd=None, timeout=None):
+    """**No safety checks applied.** Callers must check safety themselves."""
+    return _host_executor.execute(command, cwd=cwd, timeout=timeout)
 
 
 # --- FILE I/O TOOLS ---
@@ -848,6 +885,9 @@ def _check_read_safety(full_path):
         normalized = normalized[len("/private"):]
     # Case-insensitive comparison for Windows paths
     norm_lower = normalized.lower()
+    # Strip drive letter on Windows (C:/etc/shadow -> /etc/shadow)
+    if _IS_WINDOWS:
+        norm_lower = re.sub(r"^[a-z]:", "", norm_lower)
     blocked_exact = ["/etc/shadow", "/etc/gshadow"]
     blocked_fragments = [
         ".ssh/id_", "/etc/ssh/ssh_host_",
@@ -867,6 +907,24 @@ def _check_read_safety(full_path):
         if frag in norm_lower:
             return "blocked", f"Reading sensitive file matching '{frag}'"
     return "safe", None
+
+
+def safe_read_file(path, cwd):
+    """Safely read a file: resolve symlinks, check safety, then read.
+
+    Returns (content_or_error, status) where status is one of:
+        "success"  — file was read successfully
+        "blocked"  — read denied by safety filter
+        "error"    — I/O or other error
+    """
+    try:
+        full_path = os.path.realpath(os.path.join(cwd, os.path.expanduser(path)))
+    except Exception as e:
+        return f"Error resolving path: {e}", "error"
+    safety, reason = _check_read_safety(full_path)
+    if safety == "blocked":
+        return f"BLOCKED: {reason}", "blocked"
+    return read_file_content(path, cwd)
 
 
 def _check_write_safety(full_path):
@@ -907,7 +965,7 @@ def _check_write_safety(full_path):
         if path_no_drive.startswith(prefix):
             return "blocked", f"Writing to system path {prefix}"
     for exact in blocked_exact:
-        if norm_lower == exact:
+        if path_no_drive == exact:
             return "blocked", f"Writing to critical system file {exact}"
 
     confirm_prefixes = ["/etc/"]
@@ -976,6 +1034,30 @@ def _check_write_content_safety(content):
         if re.search(pattern, content):
             return "blocked", reason
     return "safe", None
+
+
+def safe_write_file(path, content, cwd):
+    """Safely write a file: resolve symlinks, check path + content safety, then write.
+
+    Returns (message_or_error, status) where status is one of:
+        "success"  — file was written successfully
+        "blocked"  — write denied by safety filter (path or content)
+        "confirm"  — write needs user confirmation (caller must prompt)
+        "error"    — I/O or other error
+    """
+    try:
+        full_path = os.path.realpath(os.path.join(cwd, os.path.expanduser(path)))
+    except Exception as e:
+        return f"Error resolving path: {e}", "error"
+    safety, reason = _check_write_safety(full_path)
+    if safety == "blocked":
+        return f"BLOCKED: {reason}", "blocked"
+    content_safety, content_reason = _check_write_content_safety(content)
+    if content_safety == "blocked":
+        return f"BLOCKED: {content_reason}", "blocked"
+    if safety == "confirm":
+        return reason, "confirm"
+    return write_file_content(path, content, cwd)
 
 
 def read_file_content(path, cwd):
@@ -1118,7 +1200,7 @@ def chat_loop():
     _health_server = None
     in_k8s = bool(os.environ.get("KUBERNETES_SERVICE_HOST"))
     if args.health_port and (args.health_port > 0 or in_k8s):
-        _health_server = start_health_server(port=args.health_port)
+        _health_server = start_health_server(port=args.health_port, bind_address=args.health_bind)
 
     if args.safe_mode:
         if os.path.exists("/var/run/secrets/kubernetes.io/serviceaccount"):
@@ -1128,6 +1210,8 @@ def chat_loop():
     else:
         executor = HostExecutor()
 
+    command_timeout = args.command_timeout
+
     log_event(logger, "session_start", {
         "provider": args.provider,
         "model": model_name,
@@ -1136,6 +1220,7 @@ def chat_loop():
         "user": os.environ.get("USER") or os.environ.get("USERNAME", "unknown"),
         "executor": type(executor).__name__,
         "safe_mode": args.safe_mode,
+        "command_timeout": command_timeout,
     })
 
     safety_rules = load_safety_rules()
@@ -1269,7 +1354,7 @@ def chat_loop():
                                 except (KeyboardInterrupt, EOFError):
                                     answer = "n"
                                 if answer == "y":
-                                    cmd_result, status, new_cwd = executor.execute(cmd, cwd=shell_state["cwd"])
+                                    cmd_result, status, new_cwd = executor.execute(cmd, cwd=shell_state["cwd"], timeout=command_timeout)
                                     if new_cwd:
                                         shell_state["cwd"] = new_cwd
                                     log_event(logger, "tool_result", {
@@ -1299,7 +1384,7 @@ def chat_loop():
                                     except (KeyboardInterrupt, EOFError):
                                         answer = "n"
                                     if answer == "y":
-                                        cmd_result, status, new_cwd = executor.execute(cmd, cwd=shell_state["cwd"])
+                                        cmd_result, status, new_cwd = executor.execute(cmd, cwd=shell_state["cwd"], timeout=command_timeout)
                                         if new_cwd:
                                             shell_state["cwd"] = new_cwd
                                         log_event(logger, "tool_result", {
@@ -1316,7 +1401,7 @@ def chat_loop():
                                             "tool_call_id": tool_call.id,
                                         })
                                 else:
-                                    cmd_result, status, new_cwd = executor.execute(cmd, cwd=shell_state["cwd"])
+                                    cmd_result, status, new_cwd = executor.execute(cmd, cwd=shell_state["cwd"], timeout=command_timeout)
                                     if new_cwd:
                                         shell_state["cwd"] = new_cwd
                                     log_event(logger, "tool_result", {
@@ -1337,17 +1422,15 @@ def chat_loop():
                                 "tool_call_id": tool_call.id,
                             })
 
-                            safety, reason = _check_read_safety(full_path)
-                            if safety == "blocked":
-                                cmd_result = f"BLOCKED: Read rejected by safety filter — {reason}."
-                                print(f"\033[91m[BLOCKED]\033[0m read_file {file_path}  ({reason})")
+                            cmd_result, status = safe_read_file(file_path, shell_state["cwd"])
+                            if status == "blocked":
+                                print(f"\033[91m[BLOCKED]\033[0m read_file {file_path}  ({cmd_result})")
                                 log_event(logger, "read_blocked", {
-                                    "path": file_path, "reason": reason,
+                                    "path": file_path, "reason": cmd_result,
                                     "tool_call_id": tool_call.id,
                                 })
                             else:
                                 print(f"\033[93m[READ]\033[0m {full_path}")
-                                cmd_result, status = read_file_content(file_path, shell_state["cwd"])
                                 log_event(logger, "tool_result", {
                                     "tool": "read_file", "path": file_path,
                                     "output": cmd_result, "status": status,
@@ -1369,49 +1452,22 @@ def chat_loop():
                                 "tool_call_id": tool_call.id,
                             })
 
-                            safety, reason = _check_write_safety(full_path)
-                            if safety == "blocked":
-                                cmd_result = f"BLOCKED: Write rejected by safety filter — {reason}. Do NOT attempt this write again."
-                                print(f"\033[91m[BLOCKED]\033[0m write_file {file_path}  ({reason})")
+                            sw_result, sw_status = safe_write_file(file_path, file_content, shell_state["cwd"])
+                            if sw_status == "blocked":
+                                cmd_result = f"{sw_result}. Do NOT attempt this write again."
+                                print(f"\033[91m[BLOCKED]\033[0m write_file {file_path}  ({sw_result})")
                                 log_event(logger, "write_blocked", {
-                                    "path": file_path, "reason": reason,
+                                    "path": file_path, "reason": sw_result,
                                     "tool_call_id": tool_call.id,
                                 })
-                            else:
-                                # Content safety scan (applies to both "confirm" and "safe" paths)
-                                content_safety, content_reason = _check_write_content_safety(file_content)
-                                if content_safety == "blocked":
-                                    cmd_result = f"BLOCKED: File content rejected by safety filter — {content_reason}. Do NOT attempt this write again."
-                                    print(f"\033[91m[BLOCKED]\033[0m write_file {file_path}  (dangerous content: {content_reason})")
-                                    log_event(logger, "write_content_blocked", {
-                                        "path": file_path, "reason": content_reason,
-                                        "tool_call_id": tool_call.id,
-                                    })
-                                elif safety == "confirm":
-                                    print(f"\033[93m[WARNING]\033[0m write_file {file_path}")
-                                    print(f"  Reason: {reason}")
-                                    try:
-                                        answer = input("  Allow this write? (y/N): ").strip().lower()
-                                    except (KeyboardInterrupt, EOFError):
-                                        answer = "n"
-                                    if answer == "y":
-                                        print(f"\033[93m[WRITE]\033[0m {full_path} ({len(file_content)} chars)")
-                                        cmd_result, status = write_file_content(file_path, file_content, shell_state["cwd"])
-                                        if status == "success":
-                                            _written_files.add(full_path)
-                                        log_event(logger, "tool_result", {
-                                            "tool": "write_file", "path": file_path,
-                                            "output": cmd_result, "status": status,
-                                            "tool_call_id": tool_call.id,
-                                        })
-                                    else:
-                                        cmd_result = f"DENIED: User rejected this write — {reason}."
-                                        print(f"\033[91m[DENIED]\033[0m Write rejected by user.")
-                                        log_event(logger, "write_denied", {
-                                            "path": file_path, "reason": reason,
-                                            "tool_call_id": tool_call.id,
-                                        })
-                                else:
+                            elif sw_status == "confirm":
+                                print(f"\033[93m[WARNING]\033[0m write_file {file_path}")
+                                print(f"  Reason: {sw_result}")
+                                try:
+                                    answer = input("  Allow this write? (y/N): ").strip().lower()
+                                except (KeyboardInterrupt, EOFError):
+                                    answer = "n"
+                                if answer == "y":
                                     print(f"\033[93m[WRITE]\033[0m {full_path} ({len(file_content)} chars)")
                                     cmd_result, status = write_file_content(file_path, file_content, shell_state["cwd"])
                                     if status == "success":
@@ -1421,6 +1477,23 @@ def chat_loop():
                                         "output": cmd_result, "status": status,
                                         "tool_call_id": tool_call.id,
                                     })
+                                else:
+                                    cmd_result = f"DENIED: User rejected this write — {sw_result}."
+                                    print(f"\033[91m[DENIED]\033[0m Write rejected by user.")
+                                    log_event(logger, "write_denied", {
+                                        "path": file_path, "reason": sw_result,
+                                        "tool_call_id": tool_call.id,
+                                    })
+                            else:
+                                # sw_status == "success"
+                                cmd_result = sw_result
+                                print(f"\033[93m[WRITE]\033[0m {full_path} ({len(file_content)} chars)")
+                                _written_files.add(full_path)
+                                log_event(logger, "tool_result", {
+                                    "tool": "write_file", "path": file_path,
+                                    "output": cmd_result, "status": sw_status,
+                                    "tool_call_id": tool_call.id,
+                                })
 
                         else:
                             cmd_result = f"Error: Unknown tool '{tool_call.function.name}'"

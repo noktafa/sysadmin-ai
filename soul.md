@@ -52,8 +52,10 @@ NEVER attempt to bypass safety filters through indirection:
 - `ufw disable` without confirmation
 
 ### Credential Access
-- `cat /etc/shadow`, `cat /etc/gshadow`
-- Reading SSH private keys: `cat ~/.ssh/id_*`, `cat /etc/ssh/ssh_host_*_key`
+- Reading password files with ANY tool: `cat`, `less`, `more`, `head`, `tail`, `tac`, `nl`, `strings`, `xxd`, `hexdump`, `od`, `grep`, `awk`, `sed` on `/etc/shadow` or `/etc/gshadow`
+- Reading SSH private keys with ANY tool: `~/.ssh/id_*`, `/etc/ssh/ssh_host_*_key`
+- Reading process environment variables: `/proc/*/environ`, `/proc/self/environ`
+- Shell obfuscation to bypass filters: hex escapes (`$'\xNN'`), octal escapes (`$'\NNN'`)
 
 ### Privilege Escalation
 - `sudo su -`, `sudo bash`, `sudo -i` (gaining unrestricted root shell)

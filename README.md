@@ -24,7 +24,7 @@
 |-----------|---------------|
 | **Stateless execution** | Each command runs in an isolated `subprocess` &mdash; no persistent shell, no accumulated hidden state |
 | **Context awareness** | Python-side CWD tracking + session state gives the feel of a persistent shell without the risks |
-| **Safety-first** | Two-tier blocklist/graylist filter with 96 regex patterns intercepts dangerous commands before execution |
+| **Safety-first** | Two-tier blocklist/graylist filter with ~100 regex patterns intercepts dangerous commands before execution (best-effort heuristic — see [Security Model](#security-model--limitations)) |
 | **Triple execution backends** | `HostExecutor` (direct subprocess), `DockerExecutor` (disposable container), or `KubernetesExecutor` (ephemeral K8s pod) via Strategy Pattern |
 | **Native file I/O** | Dedicated `read_file` / `write_file` tools bypass the shell entirely &mdash; no escaping issues |
 | **Audit trail** | Structured JSONL logging with automatic secret redaction (19 patterns), optional stderr output for K8s log aggregators |
@@ -70,12 +70,15 @@ python3 sysadmin_ai.py [OPTIONS]
 | `--safe-mode` | Run commands inside a Docker container (or K8s pod if running in Kubernetes) instead of directly on the host |
 | `--log-stdout` | Also emit structured JSON logs to stderr (auto-enabled in K8s) |
 | `--health-port PORT` | Port for `/healthz` and `/readyz` endpoints (default: `8080`, `0` to disable) |
+| `--health-bind ADDR` | Bind address for health endpoint (default: `127.0.0.1`, or `0.0.0.0` in K8s) |
+| `--command-timeout SECS` | Seconds before a running command is killed (default: `30`). Also: `SYSADMIN_AI_COMMAND_TIMEOUT` env var |
 
 ### Environment Variables
 
 - `SYSADMIN_AI_API_KEY` / `OPENAI_API_KEY` — API key
 - `SYSADMIN_AI_API_BASE` — API base URL override
 - `SYSADMIN_AI_MODEL` — Model name override
+- `SYSADMIN_AI_COMMAND_TIMEOUT` — Command timeout in seconds (default: 30)
 - `KUBERNETES_SERVICE_HOST` — Auto-detected in K8s pods; enables stderr logging and health endpoint
 
 ## Persistent Shell State
@@ -170,7 +173,7 @@ When `--safe-mode` is used inside a Kubernetes pod, `KubernetesExecutor` is auto
 
 Every command the LLM requests goes through a two-tier safety check before execution:
 
-- **Blocklist** — 71 regex patterns that unconditionally reject dangerous commands. Blocked commands are never executed.
+- **Blocklist** — ~80 regex patterns that reject known-dangerous command forms. This is a **best-effort heuristic filter, not a security boundary.** See [Security Model & Limitations](#security-model--limitations) below. Blocked commands are never executed.
 - **Graylist** — commands that are risky but sometimes legitimate prompt the user for `y/N` confirmation before running.
 
 Both tiers include OS-specific patterns:
@@ -187,6 +190,28 @@ Both tiers include OS-specific patterns:
 | Kubernetes | `kubectl delete/drain/exec`, `kubectl get secret`, service account tokens, K8s API curl, `helm delete/uninstall` | — |
 | Container escape | Docker socket mount/read, `/proc/*/environ` | — |
 | macOS-specific | `csrutil disable`, `nvram` | — |
+
+### Security Model & Limitations
+
+SysAdmin AI uses **defense-in-depth** — multiple heuristic layers working together. No single layer is a hard security boundary:
+
+| Layer | What it catches | Limitations |
+|-------|----------------|-------------|
+| **Regex blocklist** | Known-dangerous command patterns (~80 rules) | Bypassable via variable expansion, hex/octal escapes, backtick substitution, quote splitting, globs |
+| **Graylist + human confirmation** | Risky-but-legitimate operations | Requires an attentive human in the loop |
+| **soul.md behavioral rules** | LLM-level guidance on safe practices | Advisory — depends on LLM compliance |
+| **File I/O safety** | Credential file reads, system path writes, dangerous content in written files | Path-based heuristics, not MAC/DAC enforcement |
+| **Write-then-execute detection** | AI writes a script then immediately runs it | Only tracks the current session |
+| **Prompt injection delimiters** | Tool output interpreted as instructions | Heuristic — determined LLM jailbreaks may succeed |
+
+**Known bypasses for the regex blocklist:**
+- Shell variable expansion: `X=/etc/shadow; cat $X`
+- Bash ANSI-C hex escapes: `$'\x63\x61\x74' /etc/shadow`
+- Backtick substitution: `` `echo cat` /etc/shadow ``
+- Quote splitting: `ca""t /etc/shadow`
+- Glob expansion: `cat /etc/shado?`
+
+**Why this tradeoff exists:** SysAdmin AI administers the actual machine — commands are unbounded by nature. A complete allow-list is impractical for system administration. The blocklist catches accidental and LLM-generated dangerous commands, while the human-in-the-loop graylist provides the strongest control for ambiguous cases. For high-security environments, use `--safe-mode` to run commands inside a disposable container.
 
 ### soul.md
 
@@ -323,7 +348,7 @@ A complete set of Kubernetes manifests is provided in `k8s/`:
 | `k8s/deployment.yaml` | Deployment with non-root security context, resource limits, health probes, secret envFrom |
 | `k8s/service.yaml` | ClusterIP service exposing health port |
 | `k8s/networkpolicy.yaml` | Egress restricted to DNS (53), vLLM (8000), HTTPS (443) |
-| `k8s/rbac.yaml` | ServiceAccount with `automountServiceAccountToken: false` |
+| `k8s/serviceaccount.yaml` | ServiceAccount with `automountServiceAccountToken: false` |
 | `k8s/pdb.yaml` | PodDisruptionBudget (minAvailable: 1) |
 | `k8s/secret.yaml` | Template for API keys |
 
@@ -359,9 +384,26 @@ Run the full test suite:
 python -m pytest tests/ -v
 ```
 
-133 tests across 27 classes covering safety filters, shell execution, PowerShell wrapping, Windows execution, CWD tracking, encoding, message history trimming, log redaction, executor abstraction, file I/O, path traversal, symlink safety, platform constants, interpreter evasion blocking, script execution graylist, write content scanning, prompt injection delimiters, and script execution tracking. Windows-only and macOS-only tests are automatically skipped on other platforms.
+142 tests across 34 classes covering safety filters, shell execution, PowerShell wrapping, Windows execution, CWD tracking, encoding, message history trimming, log redaction, executor abstraction, file I/O, path traversal, symlink safety, platform constants, interpreter evasion blocking, script execution graylist, write content scanning, prompt injection delimiters, script execution tracking, alternative reader blocking, shell obfuscation detection, configurable command timeout, safe read/write wrappers, and health endpoint bind address. Windows-only and macOS-only tests are automatically skipped on other platforms.
 
 ## Release Notes
+
+### v0.17.0
+
+- **Security hardening** — 5 critical and 6 high-priority fixes addressing blocklist bypasses, hardcoded timeouts, unsafe I/O code paths, exposed health endpoint, and infrastructure misconfigurations.
+- **Alternative reader blocking (C1)** — ~10 new blocked patterns for `less`, `more`, `head`, `tail`, `tac`, `nl`, `strings`, `xxd`, `hexdump`, `od`, `grep`, `awk`, `sed` targeting `/etc/shadow`, `/etc/gshadow`, `.ssh/id_*`, `/etc/ssh/ssh_host_*_key`, `/var/run/secrets/kubernetes.io/`, and `/proc/*/environ`. Shell obfuscation detection for bash hex escapes (`$'\xNN'`) and octal escapes (`$'\NNN'`). Security Model & Limitations section added to README documenting defense layers and known bypasses.
+- **Configurable command timeout (C2)** — new `--command-timeout` CLI flag and `SYSADMIN_AI_COMMAND_TIMEOUT` env var. `timeout` parameter added to `Executor.execute()` ABC and all three executor implementations. Default unchanged at 30s.
+- **Safe read wrapper (C3)** — new `safe_read_file()` function combining symlink resolution, safety check, and file read. `chat_loop()` refactored to use it.
+- **Safe write wrapper (C4)** — new `safe_write_file()` function combining symlink resolution, path safety, content safety, and file write. `chat_loop()` refactored to use it.
+- **Health endpoint bind address (C5)** — `start_health_server()` now defaults to `127.0.0.1` on bare metal, `0.0.0.0` in K8s. New `--health-bind` CLI flag.
+- **PDB fix (H1)** — `minAvailable: 1` → `maxUnavailable: 1` in `k8s/pdb.yaml` to unblock cluster drains.
+- **Rename rbac.yaml (H2)** — `k8s/rbac.yaml` → `k8s/serviceaccount.yaml` to match actual content.
+- **Dockerfile UID fix (H3)** — UID/GID pinned to 1000 to match K8s `runAsUser: 1000`.
+- **Optional kubernetes dependency (H4)** — removed `kubernetes>=28.0.0` from `requirements.txt` (already lazily imported with `try/except`).
+- **run_shell_command docstring (H5)** — documents that no safety checks are applied; callers must check safety themselves.
+- **MIT LICENSE file (H6)** — added `LICENSE` matching the README badge.
+- **Windows drive-letter fix** — `_check_read_safety` and `_check_write_safety` now strip drive letters on Windows for all path matching (exact + fragment/prefix).
+- **142 tests passing** — 34 test classes, up from 133/27 in v0.16.0. New classes: `TestAlternativeReadersBlocked`, `TestAlternativeReadersOnSafeFiles`, `TestShellObfuscationBlocked`, `TestCommandTimeout`, `TestSafeReadFile`, `TestSafeWriteFile`, `TestHealthBindAddress`.
 
 ### v0.16.0
 
@@ -385,7 +427,7 @@ python -m pytest tests/ -v
 - **Kubernetes manifests** — `k8s/` directory with Deployment (hardened security context, resource limits, probes), Service, NetworkPolicy (egress restricted to DNS/vLLM/HTTPS), RBAC (no service account token), PDB, and Secret template.
 - **soul.md K8s guardrails** — new "Kubernetes Environment" section with behavioral rules for service account tokens, K8s API access, `kubectl` operations, resource limits, and ConfigMap/Secret safety.
 - **New CLI flags** — `--log-stdout`, `--health-port`
-- **New dependency** — `kubernetes>=28.0.0` (required only for K8s executor)
+- **Optional dependency** — `kubernetes>=28.0.0` (required only for K8s executor, lazily imported)
 
 ### v0.14.0
 
