@@ -24,10 +24,11 @@
 |-----------|---------------|
 | **Stateless execution** | Each command runs in an isolated `subprocess` &mdash; no persistent shell, no accumulated hidden state |
 | **Context awareness** | Python-side CWD tracking + session state gives the feel of a persistent shell without the risks |
-| **Safety-first** | Two-tier blocklist/graylist filter with 40+ regex patterns intercepts dangerous commands before execution |
-| **Dual execution backends** | `HostExecutor` (direct subprocess) or `DockerExecutor` (disposable container) via Strategy Pattern |
+| **Safety-first** | Two-tier blocklist/graylist filter with 50+ regex patterns intercepts dangerous commands before execution |
+| **Triple execution backends** | `HostExecutor` (direct subprocess), `DockerExecutor` (disposable container), or `KubernetesExecutor` (ephemeral K8s pod) via Strategy Pattern |
 | **Native file I/O** | Dedicated `read_file` / `write_file` tools bypass the shell entirely &mdash; no escaping issues |
-| **Audit trail** | Structured JSONL logging with automatic secret redaction (18 patterns) |
+| **Audit trail** | Structured JSONL logging with automatic secret redaction (18 patterns), optional stderr output for K8s log aggregators |
+| **Kubernetes-ready** | Health endpoints (`/healthz`, `/readyz`), SIGTERM graceful shutdown, K8s-specific security filters, deployment manifests |
 | **Cross-platform** | OS-aware safety rules, prompts, and command wrapping for Linux, macOS, and Windows |
 
 ### Architecture Overview
@@ -35,14 +36,18 @@
 ```
 User ──> LLM (OpenAI / vLLM) ──> Safety Filter ──> Executor ──> OS
               │                     │                  │
-              │                     │           ┌──────┴──────┐
-              │                     │      HostExecutor   DockerExecutor
-              │                     │      (subprocess)   (docker exec)
-              │                     │
+              │                     │           ┌──────┼──────────────┐
+              │                     │      HostExecutor │    KubernetesExecutor
+              │                     │      (subprocess) │    (K8s pod exec)
+              │                     │            DockerExecutor
+              │                     │            (docker exec)
               │               Blocklist (reject)
               │               Graylist  (confirm)
               │
          read_file / write_file ──> Python I/O (no shell)
+
+Health: /healthz + /readyz (background thread, port 8080)
+Logs:   JSONL file + stderr (auto in K8s)
 ```
 
 ---
@@ -62,13 +67,16 @@ python3 sysadmin_ai.py [OPTIONS]
 | `--api-key KEY` | Override API key |
 | `--model NAME` | Override model name |
 | `--log-dir DIR` | Override log directory (default: `~/.sysadmin-ai/logs/`) |
-| `--safe-mode` | Run commands inside a Docker container instead of directly on the host |
+| `--safe-mode` | Run commands inside a Docker container (or K8s pod if running in Kubernetes) instead of directly on the host |
+| `--log-stdout` | Also emit structured JSON logs to stderr (auto-enabled in K8s) |
+| `--health-port PORT` | Port for `/healthz` and `/readyz` endpoints (default: `8080`, `0` to disable) |
 
 ### Environment Variables
 
 - `SYSADMIN_AI_API_KEY` / `OPENAI_API_KEY` — API key
 - `SYSADMIN_AI_API_BASE` — API base URL override
 - `SYSADMIN_AI_MODEL` — Model name override
+- `KUBERNETES_SERVICE_HOST` — Auto-detected in K8s pods; enables stderr logging and health endpoint
 
 ## Persistent Shell State
 
@@ -129,9 +137,10 @@ Command execution is decoupled from the chat loop via an `Executor` ABC. This en
 | Executor | Backend | When used |
 |----------|---------|-----------|
 | `HostExecutor` | `subprocess.run(shell=True)` on the host | Default (no flags) |
-| `DockerExecutor` | `docker exec` inside a disposable container | `--safe-mode` |
+| `DockerExecutor` | `docker exec` inside a disposable container | `--safe-mode` on bare host |
+| `KubernetesExecutor` | `kubernetes.stream` exec into ephemeral pod | `--safe-mode` inside a K8s pod |
 
-Both executors implement the same interface: `execute(command, cwd=None) → (output, status, new_cwd)` and `cleanup()`.
+All executors implement the same interface: `execute(command, cwd=None) → (output, status, new_cwd)` and `cleanup()`. When `--safe-mode` is used, the executor is auto-selected based on the environment: `KubernetesExecutor` if `/var/run/secrets/kubernetes.io/serviceaccount` exists, otherwise `DockerExecutor`.
 
 ### Safe Mode (Docker Sandbox)
 
@@ -147,6 +156,15 @@ This starts a disposable `ubuntu:22.04` container named `sysadmin-ai-<SESSION_ID
 - CWD tracking works via appended `pwd` (Linux-only containers)
 - The safety filter still runs on the host side before any command reaches the container
 - If Docker is not installed or not running, a clear `RuntimeError` is raised at startup
+
+### Safe Mode in Kubernetes
+
+When `--safe-mode` is used inside a Kubernetes pod, `KubernetesExecutor` is automatically selected instead of `DockerExecutor`. It creates an ephemeral sandbox pod with:
+
+- Non-root execution (UID 1000), all capabilities dropped
+- `automountServiceAccountToken: false` — no access to K8s API
+- Auto-detected namespace from the service account mount
+- Cleanup: sandbox pod is deleted on exit or SIGTERM
 
 ## Command Safety Filter
 
@@ -166,6 +184,8 @@ Both tiers include OS-specific patterns:
 | Network attacks | `curl \| bash`, reverse shells | `Invoke-WebRequest \| Invoke-Expression` |
 | Firewall | `iptables -F`, `ufw disable` | `netsh advfirewall ... off`, Defender disable |
 | Kernel/boot | `modprobe`, `grub-install` | `bcdedit` |
+| Kubernetes | `kubectl delete/drain/exec`, `kubectl get secret`, service account tokens, K8s API curl, `helm delete/uninstall` | — |
+| Container escape | Docker socket mount/read, `/proc/*/environ` | — |
 | macOS-specific | `csrutil disable`, `nvram` | — |
 
 ### soul.md
@@ -177,7 +197,7 @@ Safety rules from `soul.md` (if present in the script directory) are loaded into
 - **macOS-Specific** — SIP, nvram, `/System` protections
 - **Windows** — format, diskpart, registry, SAM, Defender, UAC, firewall
 - **File I/O Tools** — prefer `read_file`/`write_file` over shell, blocked write paths, read-before-write
-- **Domain-Specific Behavioral Guardrails** — 10 sections covering safe approaches to service management, database operations, network configuration, package management, log & disk management, backup & recovery, SSL/TLS certificates, containers & orchestration, cron & scheduled tasks, and user & permission management
+- **Domain-Specific Behavioral Guardrails** — 11 sections covering safe approaches to service management, database operations, network configuration, package management, log & disk management, backup & recovery, SSL/TLS certificates, containers & orchestration, Kubernetes environments, cron & scheduled tasks, and user & permission management
 - **Required Behavior** — OS-appropriate safe practices (`--dry-run` on Unix, `-WhatIf` on PowerShell)
 
 ## Native File I/O Tools
@@ -201,6 +221,8 @@ File tools have their own safety checks, mirroring the shell command safety filt
 - `/etc/shadow`, `/etc/gshadow` (password hashes)
 - `.ssh/id_*` (SSH private keys)
 - `/etc/ssh/ssh_host_*` (SSH host keys)
+- `/var/run/secrets/kubernetes.io/` (K8s service account tokens)
+- `/proc/self/environ`, `/proc/1/environ` (process environment variables)
 - SAM database, NTDS.dit (Windows)
 - Keychain files (macOS)
 
@@ -230,6 +252,8 @@ Redacted patterns include:
 - **Shell secret assignments** — `export PASSWORD=...`, `set API_KEY=...`, `$env:SECRET_TOKEN=...`
 - **Private key blocks** — `-----BEGIN RSA PRIVATE KEY-----` (all key types)
 - **AWS secret access keys** — `aws_secret_access_key = ...`
+
+When running in Kubernetes (detected via `KUBERNETES_SERVICE_HOST`), logs are also emitted to stderr in JSONL format for integration with Fluentd, Loki, CloudWatch, or other log aggregators. This can also be enabled manually with `--log-stdout`.
 
 Override the log directory with `--log-dir`:
 
@@ -268,6 +292,65 @@ python3 sysadmin_ai.py --log-dir /tmp/ai-logs
 }
 ```
 
+## Health Endpoints
+
+SysAdmin AI runs a lightweight HTTP server in a background daemon thread for Kubernetes liveness and readiness probes:
+
+| Endpoint | Behavior |
+|----------|----------|
+| `GET /healthz` | Always returns `200 ok` (liveness) |
+| `GET /readyz` | Returns `200 ok` after initialization, `503 not ready` before (readiness) |
+
+The health server starts on port 8080 by default. Disable with `--health-port 0`. Auto-enabled when running in Kubernetes.
+
+## Graceful Shutdown
+
+SysAdmin AI handles `SIGTERM` (sent by Kubernetes on pod eviction) by:
+
+1. Printing a shutdown notice
+2. Raising `SystemExit(0)` to trigger the `finally` block
+3. Cleaning up the executor (removing sandbox containers/pods)
+4. Flushing and closing all log handlers
+
+This ensures no orphaned sandbox pods and complete log capture during rolling updates or node drains.
+
+## Kubernetes Deployment
+
+A complete set of Kubernetes manifests is provided in `k8s/`:
+
+| Manifest | Description |
+|----------|-------------|
+| `k8s/deployment.yaml` | Deployment with non-root security context, resource limits, health probes, secret envFrom |
+| `k8s/service.yaml` | ClusterIP service exposing health port |
+| `k8s/networkpolicy.yaml` | Egress restricted to DNS (53), vLLM (8000), HTTPS (443) |
+| `k8s/rbac.yaml` | ServiceAccount with `automountServiceAccountToken: false` |
+| `k8s/pdb.yaml` | PodDisruptionBudget (minAvailable: 1) |
+| `k8s/secret.yaml` | Template for API keys |
+
+### Quick Start
+
+```bash
+# Build the image
+docker build -t sysadmin-ai .
+
+# Configure your API key
+kubectl create secret generic sysadmin-ai-secrets \
+  --from-literal=SYSADMIN_AI_API_KEY=your-key-here
+
+# Deploy
+kubectl apply -f k8s/
+```
+
+### Security Context
+
+The pod runs with a hardened security context:
+- `runAsNonRoot: true`, `runAsUser: 1000`
+- All capabilities dropped
+- No privilege escalation
+- Seccomp profile: `RuntimeDefault`
+- No service account token mounted
+- Network egress restricted via NetworkPolicy
+
 ## Testing
 
 Run the full test suite:
@@ -279,6 +362,20 @@ python -m pytest tests/ -v
 110 tests across 16 classes covering safety filters, shell execution, PowerShell wrapping, Windows execution, CWD tracking, encoding, message history trimming, log redaction, executor abstraction, file I/O, path traversal, symlink safety, and platform constants. Windows-only and macOS-only tests are automatically skipped on other platforms.
 
 ## Release Notes
+
+### v0.15.0
+
+- **Kubernetes-ready production hardening** — complete K8s deployment support with security filters, sandboxed execution, lifecycle management, observability, and deployment manifests.
+- **K8s security filters** — 14 new blocked patterns for `kubectl` destructive operations (`delete`, `drain`, `exec`, `get secret`), Helm destructive ops, service account token reads, Docker socket access, and `/proc/*/environ` reads. 2 new graylist patterns for `kubectl scale` and `kubectl rollout restart`. Read safety filter extended to block `/var/run/secrets/kubernetes.io/`, `/proc/self/environ`, and `/proc/1/environ`.
+- **KubernetesExecutor** — new `Executor` subclass that creates an ephemeral sandbox pod using the `kubernetes` Python client. The pod runs as non-root (UID 1000), drops all capabilities, and disables service account token mounting. Commands execute via `kubernetes.stream` exec. Auto-selected when `--safe-mode` is used inside a K8s pod.
+- **SIGTERM graceful shutdown** — signal handler raises `SystemExit(0)` on `SIGTERM`, triggering executor cleanup and log flush via the existing `finally` block. Ensures clean pod eviction during rolling updates or node drains.
+- **Structured stderr logging** — when running in Kubernetes (auto-detected via `KUBERNETES_SERVICE_HOST`) or with `--log-stdout`, structured JSONL logs are also emitted to stderr for integration with Fluentd, Loki, CloudWatch, and other log aggregators. Existing file logging is preserved.
+- **Health endpoints** — lightweight HTTP server in a daemon thread serves `/healthz` (liveness, always 200) and `/readyz` (readiness, 200 after init). Configurable via `--health-port` (default: 8080, 0 to disable).
+- **Dockerfile** — minimal `python:3.12-slim` image, non-root user, no kubectl/docker/curl binaries. Exposes port 8080 for health probes.
+- **Kubernetes manifests** — `k8s/` directory with Deployment (hardened security context, resource limits, probes), Service, NetworkPolicy (egress restricted to DNS/vLLM/HTTPS), RBAC (no service account token), PDB, and Secret template.
+- **soul.md K8s guardrails** — new "Kubernetes Environment" section with behavioral rules for service account tokens, K8s API access, `kubectl` operations, resource limits, and ConfigMap/Secret safety.
+- **New CLI flags** — `--log-stdout`, `--health-port`
+- **New dependency** — `kubernetes>=28.0.0` (required only for K8s executor)
 
 ### v0.14.0
 
