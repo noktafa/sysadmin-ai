@@ -9,7 +9,7 @@ import logging
 from datetime import datetime, timezone
 from abc import ABC, abstractmethod
 from pathlib import Path
-from openai import OpenAI
+from openai import OpenAI, APIConnectionError, APIStatusError, APITimeoutError, AuthenticationError
 
 # --- SETTINGS ---
 MAX_OUTPUT_CHARS = 8000  # Truncate long command output to protect context window
@@ -1025,9 +1025,76 @@ def chat_loop():
                 else:
                     log_event(logger, "llm_response", {"content": None})
 
+            except APIConnectionError as e:
+                import traceback
+                print(f"\033[91m[ERROR]\033[0m Cannot connect to API endpoint")
+                print(f"  Endpoint: {base_url}")
+                print(f"  Error:    {e.__cause__ or e}")
+                print(f"  Hint:     Is the server running? Check the URL and network connectivity.")
+                log_event(logger, "error", {
+                    "type": "APIConnectionError",
+                    "base_url": base_url,
+                    "error": str(e),
+                    "cause": str(e.__cause__),
+                    "traceback": traceback.format_exc(),
+                })
+
+            except APITimeoutError as e:
+                print(f"\033[91m[ERROR]\033[0m API request timed out")
+                print(f"  Model:    {model_name}")
+                print(f"  Details:  {e}")
+                print(f"  Hint:     The model may be overloaded or the request too large.")
+                log_event(logger, "error", {
+                    "type": "APITimeoutError",
+                    "model": model_name,
+                    "error": str(e),
+                })
+
+            except AuthenticationError as e:
+                print(f"\033[91m[ERROR]\033[0m Authentication failed")
+                print(f"  Status:   {e.status_code}")
+                print(f"  Details:  {e.message}")
+                print(f"  Hint:     Check your API key (OPENAI_API_KEY or --api-key).")
+                log_event(logger, "error", {
+                    "type": "AuthenticationError",
+                    "status_code": e.status_code,
+                    "error": str(e),
+                })
+
+            except APIStatusError as e:
+                print(f"\033[91m[ERROR]\033[0m API request failed (HTTP {e.status_code})")
+                print(f"  Endpoint: {base_url}")
+                print(f"  Model:    {model_name}")
+                print(f"  Status:   {e.status_code}")
+                try:
+                    body = json.dumps(e.response.json(), indent=2)
+                except Exception:
+                    body = e.response.text
+                print(f"  Response: {body}")
+                if e.status_code == 404:
+                    print(f"  Hint:     Check that the model is loaded in vLLM (vllm serve --model ...)")
+                elif e.status_code >= 500:
+                    print(f"  Hint:     Server error — the backend may be overloaded or crashing (OOM?).")
+                log_event(logger, "error", {
+                    "type": "APIStatusError",
+                    "status_code": e.status_code,
+                    "model": model_name,
+                    "base_url": base_url,
+                    "response_body": body,
+                    "error": str(e),
+                })
+
             except Exception as e:
-                print(f"\033[91m[ERROR]\033[0m API call failed: {e}")
-                log_event(logger, "error", {"error": str(e), "type": type(e).__name__})
+                import traceback
+                print(f"\033[91m[ERROR]\033[0m Unexpected error: {type(e).__name__}: {e}")
+                print(f"  Traceback:")
+                for line in traceback.format_exc().strip().splitlines():
+                    print(f"    {line}")
+                log_event(logger, "error", {
+                    "type": type(e).__name__,
+                    "error": str(e),
+                    "traceback": traceback.format_exc(),
+                })
 
     finally:
         executor.cleanup()
