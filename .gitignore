@@ -7,3 +7,6 @@ build/
 .venv/
 venv/
 .pytest_cache/
+*.log
+*.jsonl
+.DS_Store

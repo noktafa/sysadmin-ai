@@ -24,10 +24,10 @@
 |-----------|---------------|
 | **Stateless execution** | Each command runs in an isolated `subprocess` &mdash; no persistent shell, no accumulated hidden state |
 | **Context awareness** | Python-side CWD tracking + session state gives the feel of a persistent shell without the risks |
-| **Safety-first** | Two-tier blocklist/graylist filter with 50+ regex patterns intercepts dangerous commands before execution |
+| **Safety-first** | Two-tier blocklist/graylist filter with 96 regex patterns intercepts dangerous commands before execution |
 | **Triple execution backends** | `HostExecutor` (direct subprocess), `DockerExecutor` (disposable container), or `KubernetesExecutor` (ephemeral K8s pod) via Strategy Pattern |
 | **Native file I/O** | Dedicated `read_file` / `write_file` tools bypass the shell entirely &mdash; no escaping issues |
-| **Audit trail** | Structured JSONL logging with automatic secret redaction (18 patterns), optional stderr output for K8s log aggregators |
+| **Audit trail** | Structured JSONL logging with automatic secret redaction (19 patterns), optional stderr output for K8s log aggregators |
 | **Kubernetes-ready** | Health endpoints (`/healthz`, `/readyz`), SIGTERM graceful shutdown, K8s-specific security filters, deployment manifests |
 | **Cross-platform** | OS-aware safety rules, prompts, and command wrapping for Linux, macOS, and Windows |
 
@@ -170,7 +170,7 @@ When `--safe-mode` is used inside a Kubernetes pod, `KubernetesExecutor` is auto
 
 Every command the LLM requests goes through a two-tier safety check before execution:
 
-- **Blocklist** — 40+ regex patterns that unconditionally reject dangerous commands. Blocked commands are never executed.
+- **Blocklist** — 71 regex patterns that unconditionally reject dangerous commands. Blocked commands are never executed.
 - **Graylist** — commands that are risky but sometimes legitimate prompt the user for `y/N` confirmation before running.
 
 Both tiers include OS-specific patterns:
@@ -359,9 +359,19 @@ Run the full test suite:
 python -m pytest tests/ -v
 ```
 
-110 tests across 16 classes covering safety filters, shell execution, PowerShell wrapping, Windows execution, CWD tracking, encoding, message history trimming, log redaction, executor abstraction, file I/O, path traversal, symlink safety, and platform constants. Windows-only and macOS-only tests are automatically skipped on other platforms.
+133 tests across 27 classes covering safety filters, shell execution, PowerShell wrapping, Windows execution, CWD tracking, encoding, message history trimming, log redaction, executor abstraction, file I/O, path traversal, symlink safety, platform constants, interpreter evasion blocking, script execution graylist, write content scanning, prompt injection delimiters, and script execution tracking. Windows-only and macOS-only tests are automatically skipped on other platforms.
 
 ## Release Notes
+
+### v0.16.0
+
+- **Security hardening layer** — comprehensive defense-in-depth additions to block interpreter evasion, scan file content for dangerous payloads, mitigate prompt injection, and detect write-then-execute attack patterns.
+- **Interpreter evasion blocking** — 17 new blocked patterns for `bash -c`, `sh -c`, `python3 -c`, `perl -e`, `ruby -e`, `node -e`, `eval`, base64 pipe to shell/python, PowerShell `Invoke-Expression`/`iex`, `crontab -r`/`-e`, and destructive indirection (`find -exec rm`, `xargs rm`, `find -delete`).
+- **Script execution graylist** — 9 new graylist patterns requiring user confirmation for `bash *.sh`, `sh *.sh`, `python3 *.py`, `perl *.pl`, `ruby *.rb`, `node *.js`, `powershell -File`, `source`, and dot-sourcing commands.
+- **Write content scanning** — new `_check_write_content_safety()` function with 25 regex patterns that scan file content before writing. Blocks reverse shells, `curl | bash`, credential theft (shadow/SSH/mimikatz/LSASS), destructive operations, fork bombs, SUID escalation, data exfiltration, cron persistence, and PowerShell evasion payloads.
+- **Prompt injection delimiters** — `_wrap_tool_output()` wraps all tool output in `[BEGIN/END]` delimiters with system prompt instructions telling the LLM to treat delimited content strictly as data, preventing injected instructions in command output from hijacking the conversation.
+- **Write-then-execute detection** — tracks files written via `write_file` during the session. If a subsequent `run_shell_command` attempts to execute a recently-written file, it is escalated to user confirmation. `_extract_script_path()` parses script paths from bash, sh, python, perl, ruby, node, powershell, source, and dot commands.
+- **133 tests passing** — 27 test classes, up from 110/16 in v0.15.0. New classes: `TestInterpreterEvasionBlocked`, `TestScriptExecutionGraylist`, `TestWriteContentSafety`, `TestPromptInjectionDelimiters`, `TestScriptExecutionTracking`, `TestSafeCommandsNotBroken`.
 
 ### v0.15.0
 
